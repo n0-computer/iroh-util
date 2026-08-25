@@ -33,15 +33,18 @@ jobs:
         run: cargo test --locked --workspace
 
       - name: Clippy check
-        run: cargo clippy --workspace --all-targets --lib --bins --tests --benches --examples
+        run: cargo clippy --locked --workspace --all-targets --lib --bins --tests --benches --examples
 
       - name: "Cargo fmt"
         run: cargo make format-check
+      - name: Lockfile must not have moved
+        # cargo make takes no --locked; assert the lockfile instead.
+        run: git diff --exit-code Cargo.lock
 
       - name: Docs
         env:
           RUSTDOCFLAGS: --cfg docsrs
-        run: cargo doc --workspace --all-features --no-deps --document-private-items
+        run: cargo doc --locked --workspace --all-features --no-deps --document-private-items
 
   msrv:
     name: Minimal Supported Rust Version
@@ -53,7 +56,7 @@ jobs:
           toolchain: ${{ env.MSRV }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check MSRV
-        run: cargo +$MSRV check --workspace --all-targets
+        run: cargo +$MSRV check --locked --workspace --all-targets
 
   minimal-versions:
     name: Minimal Direct Dependency Versions
@@ -67,7 +70,11 @@ jobs:
         with:
           toolchain: stable
       - name: Resolve direct deps to minimum versions
-        run: cargo +nightly -Z direct-minimal-versions update
+        # Re-resolving is the point, so -Z min-publish-age guards the versions
+        # the lockfile has never seen.
+        run: |
+          cargo +nightly -Z direct-minimal-versions -Z min-publish-age update \
+            --config 'registry.global-min-publish-age="3 days"'
       - name: Check lib at minimum versions
         run: cargo check --lib --locked
 
