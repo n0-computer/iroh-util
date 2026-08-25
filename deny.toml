@@ -1,4 +1,5 @@
 [advisories]
+yanked = "deny"
 ignore = [
     # paste — unmaintained; pulled transitively via netwatch.
     "RUSTSEC-2024-0436",
