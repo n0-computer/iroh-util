@@ -1207,4 +1207,74 @@ mod tests {
         endpoint.close().await;
         Ok(())
     }
+
+    /// Checks that in-flight connection attempts do not count towards
+    /// [`Options::max_connections`], so that peers we are still trying to reach
+    /// cannot starve unrelated peers of a slot.
+    ///
+    /// Currently fails: `Actor::handle_request` sizes the pool with
+    /// `self.peers.len()`, and `peers` also holds `PeerState::Connecting`
+    /// entries, so `max_connections` attempts against unreachable peers make
+    /// every other peer fail with `TooManyConnections` until `connect_timeout`
+    /// expires.
+    #[tokio::test]
+    async fn inflight_connects_do_not_exhaust_slots() -> TestResult<()> {
+        let (live_ids, routers, address_lookup) = echo_servers(1).await?;
+        let live_peer = live_ids[0];
+
+        let max_connections = 2;
+        let mut dead = Vec::new();
+        let mut _socks = Vec::new();
+        for i in 0..max_connections {
+            let (sock, addr) = dead_addr()?;
+            _socks.push(sock);
+            let id = SecretKey::from_bytes(&[20 + i as u8; 32]).public();
+            address_lookup.add_endpoint_info(EndpointAddr {
+                id,
+                addrs: vec![addr].into_iter().collect(),
+            });
+            dead.push(id);
+        }
+
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let pool = ConnectionPool::new(
+            endpoint.clone(),
+            ECHO_ALPN,
+            Options {
+                connect_timeout: Duration::from_secs(5),
+                max_connections,
+                ..test_options()
+            },
+        );
+
+        // Park the pool at its connection limit with attempts that neither
+        // succeed nor fail until connect_timeout expires.
+        let mut parked = Vec::new();
+        for id in dead {
+            let pool = pool.clone();
+            parked.push(n0_future::task::spawn(async move {
+                pool.get_or_connect(id).await
+            }));
+        }
+        n0_future::time::sleep(Duration::from_millis(100)).await;
+
+        let res = pool.get_or_connect(live_peer).await;
+        assert!(
+            res.is_ok(),
+            "unrelated peer rejected while pool holds no connections: {res:?}"
+        );
+        drop(res);
+
+        // Let the parked attempts finish before tearing the endpoint down.
+        for p in parked {
+            let _ = p.await;
+        }
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
 }
