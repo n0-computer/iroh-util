@@ -23,11 +23,7 @@ use iroh::{
     endpoint::{ConnectError, Connection},
 };
 use n0_error::{e, stack_error};
-use n0_future::{
-    FuturesUnordered, MaybeFuture, Stream, StreamExt,
-    future::{self},
-    time::Duration,
-};
+use n0_future::{MaybeFuture, Stream, StreamExt, task::JoinSet, time::Duration};
 use tokio::sync::{
     Notify,
     mpsc::{self, error::SendError as TokioSendError},
@@ -503,8 +499,13 @@ struct Actor {
     // idle set (most recent last)
     // todo: use a better data structure if this becomes a performance issue
     idle: VecDeque<EndpointId>,
-    // per connection tasks
-    tasks: FuturesUnordered<future::Boxed<()>>,
+    /// The connection actors.
+    ///
+    /// Spawned rather than polled by this actor: `handle_msg` can wait for room
+    /// in a connection actor's inbox, and a connection actor that is still
+    /// dialing only makes room once the dial finishes, so it has to keep running
+    /// while this actor waits.
+    tasks: JoinSet<()>,
 }
 
 impl Actor {
@@ -525,7 +526,7 @@ impl Actor {
                     endpoint,
                     owner: ConnectionPool { tx: tx.clone() },
                 }),
-                tasks: FuturesUnordered::new(),
+                tasks: JoinSet::new(),
             },
             tx,
         )
@@ -588,7 +589,7 @@ impl Actor {
                 // reference to whatever the actor ended up with.
                 let mode = std::mem::replace(&mut msg.mode, Mode::Connect(id));
                 self.tasks
-                    .push(Box::pin(context.run_connection_actor(mode, conn_rx)));
+                    .spawn(context.run_connection_actor(mode, conn_rx));
 
                 // Send the handler to the new actor
                 if conn_tx.send(msg).await.is_err() {
@@ -621,7 +622,14 @@ impl Actor {
                     }
                 }
 
-                _ = self.tasks.next(), if !self.tasks.is_empty() => {}
+                Some(res) = self.tasks.join_next(), if !self.tasks.is_empty() => {
+                    if let Err(err) = res
+                        && let Ok(panic) = err.try_into_panic()
+                    {
+                        error!("connection actor panicked");
+                        std::panic::resume_unwind(panic);
+                    }
+                }
             }
         }
     }
@@ -1311,6 +1319,49 @@ mod tests {
             ),
             "closed for the wrong reason: {err:?}"
         );
+        Ok(())
+    }
+
+    /// A burst of requests for an endpoint that is still being dialed must not
+    /// starve the pool.
+    ///
+    /// Requests queue in the dialing connection actor's inbox, which it only
+    /// reads once the dial finishes. When that inbox is full, the pool actor
+    /// waits for room. The connection actors used to be polled by the pool
+    /// actor itself, so while it waited nothing drove the dial, not even its
+    /// timeout, and the pool hung for good.
+    #[tokio::test]
+    async fn burst_while_dialing_does_not_starve_the_pool() -> TestResult<()> {
+        let client = iroh::Endpoint::builder(presets::Minimal).bind().await?;
+        let lookup = MemoryLookup::new();
+        // TEST-NET-1: nothing answers, so the dial runs until the timeout.
+        let unreachable = SecretKey::from_bytes(&[7u8; 32]).public();
+        lookup.add_endpoint_info(EndpointAddr::from_parts(
+            unreachable,
+            [TransportAddr::Ip("192.0.2.1:1".parse()?)],
+        ));
+        client.address_lookup()?.add(lookup);
+        let connect_timeout = Duration::from_secs(1);
+        let options = Options {
+            connect_timeout,
+            ..Default::default()
+        };
+        let pool = ConnectionPool::new(client, b"unused", options);
+
+        // More than the connection actor's inbox holds.
+        let requests: Vec<_> = (0..150)
+            .map(|_| {
+                let pool = pool.clone();
+                tokio::spawn(async move { pool.get_or_connect(unreachable).await })
+            })
+            .collect();
+        let all = async {
+            for request in requests {
+                let res = request.await.expect("request task panicked");
+                assert!(res.is_err(), "dialed an unreachable endpoint");
+            }
+        };
+        tokio::time::timeout(connect_timeout * 5, all).await?;
         Ok(())
     }
 }
