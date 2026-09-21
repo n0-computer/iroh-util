@@ -33,7 +33,7 @@ use tokio::sync::{
     mpsc::{self, error::SendError as TokioSendError},
     oneshot,
 };
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, trace};
 
 pub type OnConnected = Arc<
     dyn Fn(&Endpoint, &ConnectionHandle) -> n0_future::future::Boxed<io::Result<()>> + Send + Sync,
@@ -339,7 +339,7 @@ impl Context {
                             match &state {
                                 Ok(state) => {
                                     let res = ConnectionRef::new(state.clone(), counter.get_one());
-                                    info!(%node_id, "Handing out ConnectionRef {}", counter.current());
+                                    debug!(%node_id, count = counter.current(), "Handing out ConnectionRef");
 
                                     // clear the idle timer
                                     idle_timer.as_mut().set_none();
