@@ -119,6 +119,58 @@ impl ConnectionRef {
     pub fn is_superseded(&self) -> bool {
         self.permit.inner.superseded.load(Ordering::SeqCst)
     }
+
+    /// Bundles `value` with this reference, so the connection stays in use for
+    /// as long as `value` does.
+    ///
+    /// See [`Guarded`].
+    pub fn guard<T>(self, value: T) -> Guarded<T> {
+        Guarded { value, conn: self }
+    }
+}
+
+/// A value that keeps a pooled connection in use for as long as it lives.
+///
+/// The pool counts a connection as in use while any [`ConnectionRef`] to it is
+/// alive, and closes it once nothing has used it for a while. Anything that
+/// works on the connection for longer than a single call -- a stream, or a
+/// codec wrapped around one -- has to keep a reference for that long. For a
+/// connection that [`ConnectionPool::handle_connection`] may later supersede,
+/// that includes serving the streams the remote opened, since the remote may
+/// keep using that connection. `Guarded` makes the two inseparable.
+///
+/// Created with [`ConnectionRef::guard`] or [`ConnectionHandle::guard`], and
+/// derefs to the value.
+#[derive(Debug)]
+pub struct Guarded<T> {
+    value: T,
+    conn: ConnectionRef,
+}
+
+impl<T> Guarded<T> {
+    /// Returns the reference that keeps the connection in use.
+    pub fn connection(&self) -> &ConnectionRef {
+        &self.conn
+    }
+
+    /// Splits into the value and the reference.
+    pub fn into_parts(self) -> (T, ConnectionRef) {
+        (self.value, self.conn)
+    }
+}
+
+impl<T> Deref for Guarded<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T> std::ops::DerefMut for Guarded<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
 }
 
 /// A connection as handed to [`Options::on_connected`].
@@ -153,6 +205,14 @@ impl ConnectionHandle {
     /// Returns a reference that keeps the connection in use while it is alive.
     pub fn get_ref(&self) -> ConnectionRef {
         ConnectionRef::new(self.connection.clone(), self.counter.get_one())
+    }
+
+    /// Bundles `value` with a new reference, so the connection stays in use for
+    /// as long as `value` does.
+    ///
+    /// See [`Guarded`].
+    pub fn guard<T>(&self, value: T) -> Guarded<T> {
+        self.get_ref().guard(value)
     }
 }
 
@@ -762,8 +822,8 @@ mod tests {
     use tracing::trace;
 
     use super::{
-        CLOSE_SUPERSEDED, ConnectionHandle, ConnectionPool, ConnectionRef, OnConnected, Options,
-        PoolConnectError,
+        CLOSE_SUPERSEDED, ConnectionHandle, ConnectionPool, ConnectionRef, Guarded, OnConnected,
+        Options, PoolConnectError,
     };
 
     const ECHO_ALPN: &[u8] = b"echo";
@@ -1214,6 +1274,34 @@ mod tests {
         );
 
         held.lock().expect("poisoned").clear();
+        let err = tokio::time::timeout(SHORT_IDLE * 10, s.first.closed()).await?;
+        assert!(
+            matches!(
+                &err,
+                iroh::endpoint::ConnectionError::ApplicationClosed(frame)
+                    if frame.reason == CLOSE_SUPERSEDED
+            ),
+            "closed for the wrong reason: {err:?}"
+        );
+        Ok(())
+    }
+
+    /// A [`Guarded`] value keeps a superseded connection open until it is
+    /// dropped.
+    #[tokio::test]
+    async fn guarded_value_keeps_connection_in_use() -> TestResult<()> {
+        let s = Superseded::new(short_idle_options()).await?;
+        let guarded: Guarded<&str> = s.first_ref.guard("a stream");
+        assert_eq!(*guarded, "a stream");
+        assert!(guarded.connection().is_superseded());
+
+        n0_future::time::sleep(SHORT_IDLE * 5).await;
+        assert!(
+            s.first.close_reason().is_none(),
+            "closed although a guarded value is alive"
+        );
+
+        drop(guarded);
         let err = tokio::time::timeout(SHORT_IDLE * 10, s.first.closed()).await?;
         assert!(
             matches!(
