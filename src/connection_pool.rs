@@ -38,7 +38,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace};
 
 pub type OnConnected = Arc<
-    dyn Fn(&Endpoint, &ConnectionHandle) -> n0_future::future::Boxed<io::Result<()>> + Send + Sync,
+    dyn Fn(&Endpoint, &WeakConnectionRef) -> n0_future::future::Boxed<io::Result<()>> + Send + Sync,
 >;
 
 /// The pool is a single actor, so we can afford a larger inbox.
@@ -87,7 +87,7 @@ impl Options {
     /// Set the on_connected callback
     pub fn with_on_connected<F, Fut>(mut self, f: F) -> Self
     where
-        F: Fn(Endpoint, ConnectionHandle) -> Fut + Send + Sync + 'static,
+        F: Fn(Endpoint, WeakConnectionRef) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = io::Result<()>> + Send + 'static,
     {
         self.on_connected = Some(Arc::new(move |ep, conn| {
@@ -130,22 +130,38 @@ impl ConnectionRef {
     pub fn is_superseded(&self) -> bool {
         self.permit.inner.superseded.load(Ordering::SeqCst)
     }
+
+    /// Returns a reference to the connection that does not keep it in use.
+    ///
+    /// See [`WeakConnectionRef`].
+    pub fn downgrade(&self) -> WeakConnectionRef {
+        WeakConnectionRef {
+            connection: self.connection.clone(),
+            counter: ConnectionCounter {
+                inner: self.permit.inner.clone(),
+            },
+        }
+    }
 }
 
-/// A connection as handed to [`Options::on_connected`].
+/// A reference to a pooled connection that does not keep it in use.
 ///
-/// Unlike a [`ConnectionRef`], holding one does not keep the connection in use,
-/// so a task that watches the connection for as long as it lives can hold it.
-/// Work that should keep the connection open takes a [`ConnectionRef`] from
-/// [`Self::get_ref`] instead. That includes serving streams the remote opened:
-/// the remote may keep using a connection the pool has superseded.
+/// It relates to [`ConnectionRef`] as `Weak` does to `Arc`: holding one does not
+/// count as a use, so a task that watches the connection for as long as it lives
+/// can hold it, and [`Self::upgrade`] returns a reference that does count. Unlike
+/// `Weak`, it keeps the connection handle itself alive, so upgrading always
+/// succeeds, and it derefs to the connection.
+///
+/// [`Options::on_connected`] receives one. Work that should keep the connection
+/// open upgrades it, and that includes serving streams the remote opened: the
+/// remote may keep using a connection the pool has superseded.
 #[derive(Debug, Clone)]
-pub struct ConnectionHandle {
+pub struct WeakConnectionRef {
     connection: Connection,
     counter: ConnectionCounter,
 }
 
-impl Deref for ConnectionHandle {
+impl Deref for WeakConnectionRef {
     type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
@@ -153,7 +169,7 @@ impl Deref for ConnectionHandle {
     }
 }
 
-impl ConnectionHandle {
+impl WeakConnectionRef {
     fn new(connection: &Connection, counter: &ConnectionCounter) -> Self {
         Self {
             connection: connection.clone(),
@@ -162,7 +178,7 @@ impl ConnectionHandle {
     }
 
     /// Returns a reference that keeps the connection in use while it is alive.
-    pub fn get_ref(&self) -> ConnectionRef {
+    pub fn upgrade(&self) -> ConnectionRef {
         ConnectionRef::new(self.connection.clone(), self.counter.get_one())
     }
 }
@@ -514,9 +530,9 @@ impl Actor {
                 continue;
             };
             debug_assert_eq!(*unused_since, Some(since));
-            // A `ConnectionHandle` takes references without going through the
-            // pool, so a peer on the list may be in use again. Its next drop to
-            // zero lists it again.
+            // Upgrading a `WeakConnectionRef` does not go through the pool, so a
+            // peer on the list may be in use again. Its next drop to zero lists
+            // it again.
             if !counter.is_unused() {
                 *unused_since = None;
                 continue;
@@ -555,7 +571,7 @@ impl Actor {
                 connected = Some(conn.clone());
                 let counter = ConnectionCounter::new(id, generation, unused_tx);
                 if let Some(f) = &on_connected {
-                    f(&endpoint, &ConnectionHandle::new(&conn, &counter))
+                    f(&endpoint, &WeakConnectionRef::new(&conn, &counter))
                         .await
                         .map_err(PoolConnectError::from)?;
                 }
@@ -807,9 +823,9 @@ impl Actor {
 
     /// Closes the connections that have been unused for the idle timeout.
     ///
-    /// A `ConnectionHandle` takes references without going through the pool, so
-    /// a listed connection may be in use again. It is taken off the list, and
-    /// its next drop to zero lists it again.
+    /// Upgrading a `WeakConnectionRef` does not go through the pool, so a listed
+    /// connection may be in use again. It is taken off the list, and its next
+    /// drop to zero lists it again.
     fn close_unused(&mut self) {
         let now = Instant::now();
         let timeout = self.options.idle_timeout;
@@ -1068,8 +1084,8 @@ mod tests {
     use tracing::trace;
 
     use super::{
-        Actor, ConnectionCounter, ConnectionHandle, ConnectionPool, ConnectionRef, OnConnected,
-        Options, PeerState, PoolConnectError, RequestRef,
+        Actor, ConnectionCounter, ConnectionPool, ConnectionRef, OnConnected, Options, PeerState,
+        PoolConnectError, RequestRef, WeakConnectionRef,
     };
 
     const ECHO_ALPN: &[u8] = b"echo";
@@ -1309,7 +1325,7 @@ mod tests {
             .address_lookup(address_lookup)
             .bind()
             .await?;
-        let on_connected = |_, conn: ConnectionHandle| async move {
+        let on_connected = |_, conn: WeakConnectionRef| async move {
             let mut stream = conn.paths_stream();
             while let Some(paths) = stream.next().await {
                 if paths.iter().any(|path| path.is_ip()) {
@@ -1845,7 +1861,7 @@ mod tests {
             ECHO_ALPN,
             test_options().with_on_connected({
                 let kept = kept.clone();
-                move |_, conn: ConnectionHandle| {
+                move |_, conn: WeakConnectionRef| {
                     *kept.lock().expect("poisoned") = Some(conn);
                     async { Err(io::Error::other("on_connect failed")) }
                 }
@@ -1890,7 +1906,7 @@ mod tests {
             }
             .with_on_connected({
                 let kept = kept.clone();
-                move |_, conn: ConnectionHandle| {
+                move |_, conn: WeakConnectionRef| {
                     *kept.lock().expect("poisoned") = Some(conn);
                     async { Ok(()) }
                 }
@@ -2093,14 +2109,14 @@ mod tests {
     /// A reference taken in `on_connected` keeps a superseded connection open.
     ///
     /// This is how streams the remote opened stay served: whatever accepts them
-    /// holds the [`ConnectionHandle`] and takes a reference per stream.
+    /// holds the [`WeakConnectionRef`] and upgrades it per stream.
     #[tokio::test]
     async fn on_connected_ref_keeps_superseded_connection_open() -> TestResult<()> {
         let held = Arc::new(std::sync::Mutex::new(Vec::new()));
         let options = short_idle_options().with_on_connected({
             let held = held.clone();
-            move |_ep, conn: ConnectionHandle| {
-                held.lock().expect("poisoned").push(conn.get_ref());
+            move |_ep, conn: WeakConnectionRef| {
+                held.lock().expect("poisoned").push(conn.upgrade());
                 async { Ok(()) }
             }
         });
@@ -2120,16 +2136,16 @@ mod tests {
         Ok(())
     }
 
-    /// A reference from a [`ConnectionHandle`] keeps an unused connection open.
+    /// An upgraded [`WeakConnectionRef`] keeps an unused connection open.
     ///
-    /// Such a reference does not go through the pool, so the connection is
-    /// still on the unused list when its idle timeout passes.
+    /// Upgrading does not go through the pool, so the connection is still on
+    /// the unused list when its idle timeout passes.
     #[tokio::test]
-    async fn handle_ref_after_idle_keeps_connection_open() -> TestResult<()> {
+    async fn upgrade_after_unused_keeps_connection_open() -> TestResult<()> {
         let handle = Arc::new(std::sync::Mutex::new(None));
         let options = short_idle_options().with_on_connected({
             let handle = handle.clone();
-            move |_ep, conn: ConnectionHandle| {
+            move |_ep, conn: WeakConnectionRef| {
                 *handle.lock().expect("poisoned") = Some(conn);
                 async { Ok(()) }
             }
@@ -2146,7 +2162,7 @@ mod tests {
         // timer before the reference comes in.
         n0_future::time::sleep(SHORT_IDLE / 4).await;
         let handle = handle.lock().expect("poisoned").take().expect("no handle");
-        let stream_ref = handle.get_ref();
+        let stream_ref = handle.upgrade();
 
         n0_future::time::sleep(SHORT_IDLE * 5).await;
         assert!(
@@ -2255,7 +2271,7 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let options = short_idle_options().with_on_connected({
             let calls = calls.clone();
-            move |_ep, _conn: ConnectionHandle| {
+            move |_ep, _conn: WeakConnectionRef| {
                 let first = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
                 async move {
                     if !first {
@@ -2296,7 +2312,7 @@ mod tests {
 
     /// A full pool does not evict a peer that is in use again.
     ///
-    /// A reference from a [`ConnectionHandle`] put it back in use.
+    /// An upgraded [`WeakConnectionRef`] put it back in use.
     ///
     /// Such a reference does not go through the pool, so the peer is still on
     /// the list of unused peers that eviction picks from.
@@ -2310,7 +2326,7 @@ mod tests {
         }
         .with_on_connected({
             let handle = handle.clone();
-            move |_ep, conn: ConnectionHandle| {
+            move |_ep, conn: WeakConnectionRef| {
                 *handle.lock().expect("poisoned") = Some(conn);
                 async { Ok(()) }
             }
@@ -2326,7 +2342,7 @@ mod tests {
         // Let the pool see the peer go unused before the reference comes in.
         n0_future::time::sleep(Duration::from_millis(50)).await;
         let handle = handle.lock().expect("poisoned").take().expect("no handle");
-        let stream_ref = handle.get_ref();
+        let stream_ref = handle.upgrade();
 
         let other = SecretKey::from_bytes(&[9u8; 32]).public();
         let res = pool.get_or_connect(other).await;
@@ -2341,6 +2357,19 @@ mod tests {
         );
         drop(stream_ref);
         server.close().await;
+        Ok(())
+    }
+
+    /// A downgraded reference does not keep the connection open.
+    #[tokio::test]
+    async fn downgraded_ref_does_not_keep_connection_open() -> TestResult<()> {
+        let s = Superseded::new(short_idle_options()).await?;
+        let weak = s.first_ref.downgrade();
+        drop(s.first_ref);
+
+        let err = tokio::time::timeout(SHORT_IDLE * 10, s.first.closed()).await?;
+        assert_closed_as_unused(&err);
+        drop(weak);
         Ok(())
     }
 }
