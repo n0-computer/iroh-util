@@ -696,7 +696,14 @@ impl Drop for OneConnection {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
 
     use iroh::{
         EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr,
@@ -994,7 +1001,6 @@ mod tests {
     ) -> Vec<
         tokio::task::JoinHandle<std::result::Result<super::ConnectionRef, super::PoolConnectError>>,
     > {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         let started = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::with_capacity(n);
         for _ in 0..n {
@@ -1016,8 +1022,6 @@ mod tests {
     /// in bounded time.
     #[tokio::test]
     async fn connection_pool_dead_peer_backlog_does_not_wedge() -> TestResult<()> {
-        use std::time::Instant;
-
         let (live_ids, routers, address_lookup) = echo_servers(1).await?;
         let live_peer = live_ids[0];
 
@@ -1067,13 +1071,13 @@ mod tests {
         }
     }
 
-    /// Same setup as `connection_pool_dead_peer_backlog_does_not_wedge`,
-    /// with concurrency below the inbox capacity. The unrelated-peer probe
-    /// must complete within one `connect_timeout` window.
+    /// A smaller dead-peer backlog does not delay an unrelated peer at all.
+    ///
+    /// Same setup as `connection_pool_dead_peer_backlog_does_not_wedge`, with a
+    /// stricter bound: the unrelated-peer probe must complete within one
+    /// `connect_timeout` window.
     #[tokio::test]
-    async fn connection_pool_dead_peer_below_inbox_cap_is_unaffected() -> TestResult<()> {
-        use std::time::Instant;
-
+    async fn connection_pool_dead_peer_does_not_delay_other_peers() -> TestResult<()> {
         let (live_ids, routers, address_lookup) = echo_servers(1).await?;
         let live_peer = live_ids[0];
 
