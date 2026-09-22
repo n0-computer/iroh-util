@@ -149,9 +149,10 @@ impl ConnectionRef {
 ///
 /// It relates to [`ConnectionRef`] as `Weak` does to `Arc`: holding one does not
 /// count as a use, so a task that watches the connection for as long as it lives
-/// can hold it, and [`Self::upgrade`] returns a reference that does count. Unlike
-/// `Weak`, it keeps the connection handle itself alive, so upgrading always
-/// succeeds, and it derefs to the connection.
+/// can hold it, and [`Self::upgrade`] returns a reference that does count. As
+/// with `Weak`, upgrading fails once the connection is gone: once the pool has
+/// closed it, or it has closed otherwise. Unlike `Weak`, it keeps the
+/// connection handle itself alive, and it derefs to the connection.
 ///
 /// [`Options::on_connected`] receives one. Work that should keep the connection
 /// open upgrades it, and that includes serving streams the remote opened: the
@@ -178,9 +179,17 @@ impl WeakConnectionRef {
         }
     }
 
-    /// Returns a reference that keeps the connection in use while it is alive.
-    pub fn upgrade(&self) -> ConnectionRef {
-        ConnectionRef::new(self.connection.clone(), self.counter.get_one())
+    /// Returns a reference that keeps the connection in use, if it is still open.
+    ///
+    /// Returns `None` once the pool has closed the connection, or it has closed
+    /// otherwise. An upgrade and the pool closing an unused connection cannot
+    /// both succeed: whichever comes first wins.
+    pub fn upgrade(&self) -> Option<ConnectionRef> {
+        if self.connection.close_reason().is_some() {
+            return None;
+        }
+        let permit = self.counter.try_get_one()?;
+        Some(ConnectionRef::new(self.connection.clone(), permit))
     }
 }
 
@@ -534,7 +543,7 @@ impl Actor {
             // Upgrading a `WeakConnectionRef` does not go through the pool, so a
             // peer on the list may be in use again. Its next drop to zero lists
             // it again.
-            if !counter.is_unused() {
+            if !counter.try_close_unused() {
                 *unused_since = None;
                 continue;
             }
@@ -569,8 +578,8 @@ impl Actor {
                         .await
                         .map_err(PoolConnectError::from)?,
                 };
-                connected = Some(conn.clone());
                 let counter = ConnectionCounter::new(id, generation, unused_tx);
+                connected = Some((conn.clone(), counter.clone()));
                 if let Some(f) = &on_connected {
                     f(&endpoint, &WeakConnectionRef::new(&conn, &counter))
                         .await
@@ -585,9 +594,9 @@ impl Actor {
             // `on_connected` failed or ran out of time. Close the connection
             // rather than drop it: the callback may have handed it to a task.
             if result.is_err()
-                && let Some(conn) = connected
+                && let Some((conn, counter)) = connected
             {
-                conn.close(0u32.into(), b"on_connected failed");
+                close_as(&conn, &counter, b"on_connected failed");
             }
             (id, generation, result)
         })
@@ -609,8 +618,8 @@ impl Actor {
         if !current {
             // PeerState was removed or changed in the meantime, discard the connection.
             debug!(%id, "stale connect result, discarding");
-            if let Ok((conn, _)) = result {
-                conn.close(0u32.into(), b"discarded");
+            if let Ok((conn, counter)) = result {
+                close_as(&conn, &counter, b"discarded");
             }
             return;
         }
@@ -619,9 +628,9 @@ impl Actor {
         };
         match result {
             // Connections made since this attempt started may have filled the pool.
-            Ok((conn, _)) if !self.make_room() => {
+            Ok((conn, counter)) if !self.make_room() => {
                 debug!(%id, "connected, but the pool is full");
-                conn.close(0u32.into(), b"too many connections");
+                close_as(&conn, &counter, b"too many connections");
                 for tx in waiters {
                     let _ = tx.send(Err(e!(PoolConnectError::TooManyConnections)));
                 }
@@ -661,7 +670,7 @@ impl Actor {
         // Connections made since the adoption started may have filled the pool.
         if !self.peers.contains_key(&id) && !self.make_room() {
             debug!(%id, "adopted, but the pool is full");
-            conn.close(0u32.into(), b"too many connections");
+            close_as(&conn, &counter, b"too many connections");
             let _ = tx.send(Err(e!(PoolConnectError::TooManyConnections)));
             return;
         }
@@ -826,7 +835,8 @@ impl Actor {
     ///
     /// Upgrading a `WeakConnectionRef` does not go through the pool, so a listed
     /// connection may be in use again. It is taken off the list, and its next
-    /// drop to zero lists it again.
+    /// drop to zero lists it again. The pool and an upgrade race for the
+    /// connection through its counter, so exactly one of them wins.
     fn close_unused(&mut self) {
         let now = Instant::now();
         let timeout = self.options.idle_timeout;
@@ -842,7 +852,7 @@ impl Actor {
             else {
                 continue;
             };
-            if counter.is_unused() {
+            if counter.try_close_unused() {
                 trace!(%id, "unused timeout, removing");
                 self.remove_peer(id);
             } else {
@@ -856,7 +866,7 @@ impl Actor {
             let Some(superseded) = self.superseded.get_mut(&(id, generation)) else {
                 continue;
             };
-            if superseded.counter.is_unused() {
+            if superseded.counter.try_close_unused() {
                 debug!(%id, "closing unused superseded connection");
                 close(&superseded.connection, &superseded.counter);
                 self.superseded.remove(&(id, generation));
@@ -914,6 +924,12 @@ fn close(connection: &Connection, counter: &ConnectionCounter) {
     } else {
         b"drop"
     };
+    close_as(connection, counter, reason);
+}
+
+/// Closes `connection` with `reason`, and fails later upgrades to it.
+fn close_as(connection: &Connection, counter: &ConnectionCounter, reason: &[u8]) {
+    counter.mark_closed();
     connection.close(0u32.into(), reason);
 }
 
@@ -994,8 +1010,15 @@ impl ConnectionPool {
     }
 }
 
+/// The bit of [`ConnectionCounterInner::count`] that marks the connection closed.
+///
+/// It lives in the same atomic as the count, so closing an unused connection and
+/// taking a reference to it cannot both succeed.
+const CLOSED: usize = 1 << (usize::BITS - 1);
+
 #[derive(Debug)]
 struct ConnectionCounterInner {
+    /// The number of references, with [`CLOSED`] set once the pool closed it.
     count: AtomicUsize,
     id: EndpointId,
     /// The generation of the connection, which unused events name.
@@ -1028,18 +1051,48 @@ impl ConnectionCounter {
     }
 
     fn current(&self) -> usize {
-        self.inner.count.load(Ordering::SeqCst)
+        self.inner.count.load(Ordering::SeqCst) & !CLOSED
     }
 
     fn is_unused(&self) -> bool {
         self.current() == 0
     }
 
+    /// Takes a reference, for a connection the pool holds as open.
     fn get_one(&self) -> OneConnection {
         self.inner.count.fetch_add(1, Ordering::SeqCst);
         OneConnection {
             inner: self.inner.clone(),
         }
+    }
+
+    /// Takes a reference, unless the pool has closed the connection.
+    fn try_get_one(&self) -> Option<OneConnection> {
+        self.inner
+            .count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                (count & CLOSED == 0).then_some(count + 1)
+            })
+            .ok()?;
+        Some(OneConnection {
+            inner: self.inner.clone(),
+        })
+    }
+
+    /// Marks an unused connection closed, and returns whether it was unused.
+    ///
+    /// If it returns `false`, a reference was taken in the meantime and the
+    /// connection stays open.
+    fn try_close_unused(&self) -> bool {
+        self.inner
+            .count
+            .compare_exchange(0, CLOSED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Marks the connection closed, whether or not it is in use.
+    fn mark_closed(&self) {
+        self.inner.count.fetch_or(CLOSED, Ordering::SeqCst);
     }
 }
 
@@ -1062,6 +1115,7 @@ impl Clone for OneConnection {
 
 impl Drop for OneConnection {
     fn drop(&mut self) {
+        // A closed connection never counts as going unused: `CLOSED` is set.
         if self.inner.count.fetch_sub(1, Ordering::SeqCst) == 1 {
             // Send an unused event to the actor.
             let _ = self
@@ -2128,7 +2182,9 @@ mod tests {
         let options = short_idle_options().with_on_connected({
             let held = held.clone();
             move |_ep, conn: WeakConnectionRef| {
-                held.lock().expect("poisoned").push(conn.upgrade());
+                held.lock()
+                    .expect("poisoned")
+                    .push(conn.upgrade().expect("open"));
                 async { Ok(()) }
             }
         });
@@ -2174,7 +2230,7 @@ mod tests {
         // timer before the reference comes in.
         n0_future::time::sleep(SHORT_IDLE / 4).await;
         let handle = handle.lock().expect("poisoned").take().expect("no handle");
-        let stream_ref = handle.upgrade();
+        let stream_ref = handle.upgrade().expect("open");
 
         n0_future::time::sleep(SHORT_IDLE * 5).await;
         assert!(
@@ -2354,7 +2410,7 @@ mod tests {
         // Let the pool see the peer go unused before the reference comes in.
         n0_future::time::sleep(Duration::from_millis(50)).await;
         let handle = handle.lock().expect("poisoned").take().expect("no handle");
-        let stream_ref = handle.upgrade();
+        let stream_ref = handle.upgrade().expect("open");
 
         let other = SecretKey::from_bytes(&[9u8; 32]).public();
         let res = pool.get_or_connect(other).await;
@@ -2400,6 +2456,62 @@ mod tests {
         drop(clone);
         let err = tokio::time::timeout(SHORT_IDLE * 10, s.first.closed()).await?;
         assert_closed_as_unused(&err);
+        Ok(())
+    }
+
+    /// An upgrade and the pool closing an unused connection cannot both succeed.
+    ///
+    /// Whichever comes first wins: an upgrade keeps the pool from closing the
+    /// connection, and a close makes later upgrades fail.
+    #[test]
+    fn upgrade_and_idle_close_exclude_each_other() {
+        let id = SecretKey::from_bytes(&[4u8; 32]).public();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let counter = ConnectionCounter::new(id, 0, tx.clone());
+        let permit = counter.try_get_one().expect("open connection");
+        assert!(!counter.try_close_unused(), "closed a connection in use");
+        drop(permit);
+        assert!(counter.try_close_unused());
+        assert!(
+            counter.try_get_one().is_none(),
+            "upgraded a closed connection"
+        );
+
+        let counter = ConnectionCounter::new(id, 1, tx);
+        counter.mark_closed();
+        assert!(
+            counter.try_get_one().is_none(),
+            "upgraded a closed connection"
+        );
+    }
+
+    /// Upgrading fails once the pool has closed the connection.
+    #[tokio::test]
+    async fn upgrade_after_close_fails() -> TestResult<()> {
+        let handle = Arc::new(std::sync::Mutex::new(None));
+        let options = short_idle_options().with_on_connected({
+            let handle = handle.clone();
+            move |_ep, conn: WeakConnectionRef| {
+                *handle.lock().expect("poisoned") = Some(conn);
+                async { Ok(()) }
+            }
+        });
+        let server = iroh::Endpoint::builder(presets::Minimal)
+            .alpns(vec![INCOMING_ALPN.to_vec()])
+            .bind()
+            .await?;
+        let client = iroh::Endpoint::bind(presets::Minimal).await?;
+        let pool = ConnectionPool::new(server.clone(), INCOMING_ALPN, options);
+        let (_outgoing, conn_ref) = Superseded::connect(&client, &server, &pool).await?;
+        let weak = handle.lock().expect("poisoned").take().expect("no handle");
+        assert!(weak.upgrade().is_some());
+
+        pool.close(conn_ref.remote_id()).await?;
+        // `close` returns once the request is queued; wait for the pool to act.
+        tokio::time::timeout(SHORT_IDLE * 5, conn_ref.closed()).await?;
+        assert!(weak.upgrade().is_none(), "upgraded a closed connection");
+        server.close().await;
         Ok(())
     }
 }
