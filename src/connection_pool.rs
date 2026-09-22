@@ -353,7 +353,7 @@ impl Actor {
                         self.unused.remove(&(since, id));
                     }
                     let one = counter.get_one();
-                    info!(%id, "Handing out ConnectionRef {}", counter.current());
+                    debug!(%id, count = counter.current(), "Handing out ConnectionRef");
                     let _ = req.tx.send(Ok(ConnectionRef::new(connection.clone(), one)));
                     return;
                 }
