@@ -180,6 +180,8 @@ enum PeerState {
     },
     /// We have a connection to the peer.
     Ready {
+        /// The generation of the attempt that made the connection.
+        generation: u64,
         connection: Connection,
         counter: ConnectionCounter,
         unused_since: Option<Instant>,
@@ -207,7 +209,9 @@ struct Actor {
     /// Generation counter used to distinguish between connection attempts to the same peer.
     next_generation: u64,
     /// Futures for connection close watchers.
-    conn_close: FuturesUnordered<Boxed<EndpointId>>,
+    ///
+    /// Each yields the peer and the generation of the connection it watches.
+    conn_close: FuturesUnordered<Boxed<(EndpointId, u64)>>,
     /// Futures for cleaning up unused connections after the unused timeout.
     unused_timers: FuturesUnordered<Boxed<EndpointId>>,
     /// Currently unused connections, in order of when they became unused.
@@ -257,9 +261,8 @@ impl Actor {
                     self.handle_connect_result(id, generation, result);
                 }
 
-                Some(id) = self.conn_close.next(), if !self.conn_close.is_empty() => {
-                    trace!(%id, "connection closed by peer");
-                    self.remove_peer(id);
+                Some((id, generation)) = self.conn_close.next(), if !self.conn_close.is_empty() => {
+                    self.handle_conn_closed(id, generation);
                 }
 
                 Some(id) = self.unused_timers.next(), if !self.unused_timers.is_empty() => {
@@ -322,6 +325,7 @@ impl Actor {
                     connection,
                     counter,
                     unused_since,
+                    ..
                 } => {
                     *unused_since = None;
                     let one = counter.get_one();
@@ -439,11 +443,11 @@ impl Actor {
                 info!(%id, "connected, {} ref(s) outstanding", counter.current());
 
                 // Create a future that waits for the connection to close.
-                let close_fut: Boxed<EndpointId> = {
+                let close_fut: Boxed<(EndpointId, u64)> = {
                     let conn = conn.clone();
                     Box::pin(async move {
                         conn.closed().await;
-                        id
+                        (id, generation)
                     })
                 };
                 self.conn_close.push(close_fut);
@@ -459,6 +463,7 @@ impl Actor {
                 self.peers.insert(
                     id,
                     PeerState::Ready {
+                        generation,
                         connection: conn,
                         counter,
                         unused_since,
@@ -471,6 +476,21 @@ impl Actor {
                     let _ = tx.send(Err(cause.clone()));
                 }
             }
+        }
+    }
+
+    /// Handles a connection closing, by us or by the peer.
+    ///
+    /// Only acts if the connection is still the peer's current one. One the
+    /// pool replaced has closed already, and must not take down its successor.
+    fn handle_conn_closed(&mut self, id: EndpointId, generation: u64) {
+        let current = matches!(
+            self.peers.get(&id),
+            Some(PeerState::Ready { generation: g, .. }) if *g == generation
+        );
+        if current {
+            trace!(%id, "connection closed");
+            self.remove_peer(id);
         }
     }
 
@@ -665,7 +685,9 @@ mod tests {
     use testresult::TestResult;
     use tracing::trace;
 
-    use super::{ConnectionPool, OnConnected, Options, PoolConnectError};
+    use super::{
+        Actor, ConnectionCounter, ConnectionPool, OnConnected, Options, PeerState, PoolConnectError,
+    };
 
     const ECHO_ALPN: &[u8] = b"echo";
 
@@ -1330,6 +1352,51 @@ mod tests {
             "expected one connection and one TooManyConnections: {a:?}, {b:?}"
         );
         drop((a, b));
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
+
+    /// A stale close event leaves the current connection alone.
+    ///
+    /// The event is for a connection the peer no longer has. The pool closes a
+    /// connection before it replaces it, and polls close events before its
+    /// inbox, so this cannot happen through the public API yet. The test calls
+    /// the handler directly.
+    #[tokio::test]
+    async fn stale_close_event_keeps_the_current_connection() -> TestResult<()> {
+        let (ids, routers, address_lookup) = echo_servers(1).await?;
+        let id = ids[0];
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let conn = endpoint.connect(id, ECHO_ALPN).await?;
+        let (mut actor, _tx) = Actor::new(endpoint.clone(), ECHO_ALPN, test_options());
+        let counter = ConnectionCounter::new(id, actor.unused_tx.clone());
+        actor.peers.insert(
+            id,
+            PeerState::Ready {
+                generation: 1,
+                connection: conn.clone(),
+                counter,
+                unused_since: None,
+            },
+        );
+
+        actor.handle_conn_closed(id, 0);
+        assert!(
+            actor.peers.contains_key(&id),
+            "a stale close event removed the peer"
+        );
+        assert!(
+            conn.close_reason().is_none(),
+            "a stale close event closed the connection"
+        );
+        actor.handle_conn_closed(id, 1);
+        assert!(!actor.peers.contains_key(&id));
+
         shutdown_routers(routers).await;
         endpoint.close().await;
         Ok(())
