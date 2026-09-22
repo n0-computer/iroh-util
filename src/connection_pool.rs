@@ -220,12 +220,11 @@ struct Actor {
     ///
     /// Each yields the peer and the generation of the connection it watches.
     conn_close: FuturesUnordered<Boxed<(EndpointId, u64)>>,
-    /// Futures for cleaning up unused connections after the unused timeout.
-    unused_timers: FuturesUnordered<Boxed<EndpointId>>,
     /// Currently unused connections, in order of when they became unused.
     ///
     /// Keyed by each peer's `unused_since`, so a peer's entry can be found and
-    /// removed without a scan.
+    /// removed without a scan. The first entry is the next connection to close
+    /// for being unused, so the actor needs a single timer, set for it.
     unused: BTreeSet<(Instant, EndpointId)>,
 }
 
@@ -249,7 +248,6 @@ impl Actor {
                 connecting: FuturesUnordered::new(),
                 next_generation: 0,
                 conn_close: FuturesUnordered::new(),
-                unused_timers: FuturesUnordered::new(),
                 unused: BTreeSet::new(),
             },
             tx,
@@ -260,6 +258,10 @@ impl Actor {
         // We bias processing internal events before accepting more work from
         // the external mailbox.
         loop {
+            let next_unused_timer_at = self
+                .unused
+                .first()
+                .map(|(since, _)| *since + self.options.idle_timeout);
             tokio::select! {
                 biased;
 
@@ -276,8 +278,13 @@ impl Actor {
                     self.handle_conn_closed(id, generation);
                 }
 
-                Some(id) = self.unused_timers.next(), if !self.unused_timers.is_empty() => {
-                    self.handle_unused_timer(id);
+                _ = async {
+                    match next_unused_timer_at {
+                        Some(at) => n0_future::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.close_unused();
                 }
 
                 msg = self.rx.recv() => {
@@ -481,9 +488,7 @@ impl Actor {
 
                 let unused_since = counter.is_unused().then(Instant::now);
                 if let Some(since) = unused_since {
-                    // Schedule an idle timer if it is already unused here.
                     self.unused.insert((since, id));
-                    self.schedule_unused_timer(id);
                 }
                 self.peers.insert(
                     id,
@@ -538,35 +543,16 @@ impl Actor {
         }
         self.unused.insert((now, id));
         trace!(%id, "peer unused");
-        self.schedule_unused_timer(id);
     }
 
-    fn schedule_unused_timer(&mut self, id: EndpointId) {
-        let timeout = self.options.idle_timeout;
-        let timer: Boxed<EndpointId> = Box::pin(async move {
-            n0_future::time::sleep(timeout).await;
-            id
-        });
-        self.unused_timers.push(timer);
-    }
-
-    fn handle_unused_timer(&mut self, id: EndpointId) {
-        let Some(PeerState::Ready {
-            counter,
-            unused_since,
-            ..
-        }) = self.peers.get(&id)
-        else {
-            // PeerState is no longer what we expect. Either missing entirely
-            // or Connecting. In either case, we must not do anything.
-            return;
-        };
-        if !counter.is_unused() {
-            return;
-        }
-        let Some(since) = unused_since else { return };
-        if since.elapsed() >= self.options.idle_timeout {
+    /// Closes the connections that have been unused for the idle timeout.
+    fn close_unused(&mut self) {
+        let now = Instant::now();
+        while let Some(&(since, id)) = self.unused.first()
+            && since + self.options.idle_timeout <= now
+        {
             trace!(%id, "unused timeout, removing");
+            self.unused.pop_first();
             self.remove_peer(id);
         }
     }
@@ -1476,6 +1462,62 @@ mod tests {
             conn.close_reason().is_some(),
             "the connection stayed open after on_connected failed"
         );
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
+
+    /// Using a connection again restarts its idle timeout.
+    ///
+    /// The connection is closed `idle_timeout` after it last went unused, not
+    /// after it first did.
+    #[tokio::test]
+    async fn use_restarts_the_idle_timeout() -> TestResult<()> {
+        let (ids, routers, address_lookup) = echo_servers(1).await?;
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let idle_timeout = Duration::from_millis(500);
+        let kept = Arc::new(std::sync::Mutex::new(None));
+        let pool = ConnectionPool::new(
+            endpoint.clone(),
+            ECHO_ALPN,
+            Options {
+                idle_timeout,
+                ..test_options()
+            }
+            .with_on_connected({
+                let kept = kept.clone();
+                move |_, conn: Connection| {
+                    *kept.lock().expect("poisoned") = Some(conn);
+                    async { Ok(()) }
+                }
+            }),
+        );
+        drop(pool.get_or_connect(ids[0]).await?);
+        let conn = kept
+            .lock()
+            .expect("poisoned")
+            .take()
+            .expect("callback not called");
+
+        n0_future::time::sleep(idle_timeout * 3 / 5).await;
+        drop(pool.get_or_connect(ids[0]).await?);
+        // Past the first timeout, within the second.
+        n0_future::time::sleep(idle_timeout * 3 / 5).await;
+        assert!(
+            conn.close_reason().is_none(),
+            "closed before its restarted timeout"
+        );
+        // Past the second.
+        n0_future::time::sleep(idle_timeout * 4 / 5).await;
+        assert!(
+            conn.close_reason().is_some(),
+            "not closed after its timeout"
+        );
+
         shutdown_routers(routers).await;
         endpoint.close().await;
         Ok(())
