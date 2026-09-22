@@ -18,7 +18,6 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
 };
 
 use iroh::{
@@ -26,7 +25,11 @@ use iroh::{
     endpoint::{ConnectError, Connection},
 };
 use n0_error::{e, stack_error};
-use n0_future::{FuturesUnordered, StreamExt, future::Boxed, time::Duration};
+use n0_future::{
+    FuturesUnordered, StreamExt,
+    future::Boxed,
+    time::{Duration, Instant},
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace};
 
