@@ -11,7 +11,7 @@
 //!
 //! This is using a single actor to manage all connections.
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap},
     io,
     ops::Deref,
     sync::{
@@ -223,7 +223,10 @@ struct Actor {
     /// Futures for cleaning up unused connections after the unused timeout.
     unused_timers: FuturesUnordered<Boxed<EndpointId>>,
     /// Currently unused connections, in order of when they became unused.
-    unused: VecDeque<EndpointId>,
+    ///
+    /// Keyed by each peer's `unused_since`, so a peer's entry can be found and
+    /// removed without a scan.
+    unused: BTreeSet<(Instant, EndpointId)>,
 }
 
 impl Actor {
@@ -247,7 +250,7 @@ impl Actor {
                 next_generation: 0,
                 conn_close: FuturesUnordered::new(),
                 unused_timers: FuturesUnordered::new(),
-                unused: VecDeque::new(),
+                unused: BTreeSet::new(),
             },
             tx,
         )
@@ -320,9 +323,6 @@ impl Actor {
 
     fn handle_request(&mut self, req: RequestRef) {
         let id = req.id;
-        // Remove the id from the unused list,
-        self.unused.retain(|x| *x != id);
-
         if let Some(state) = self.peers.get_mut(&id) {
             match state {
                 PeerState::Connecting { waiters, .. } => {
@@ -335,7 +335,9 @@ impl Actor {
                     unused_since,
                     ..
                 } => {
-                    *unused_since = None;
+                    if let Some(since) = unused_since.take() {
+                        self.unused.remove(&(since, id));
+                    }
                     let one = counter.get_one();
                     info!(%id, "Handing out ConnectionRef {}", counter.current());
                     let _ = req.tx.send(Ok(ConnectionRef::new(connection.clone(), one)));
@@ -375,13 +377,14 @@ impl Actor {
         if connections < self.options.max_connections {
             return true;
         }
-        let Some(id) = self.unused.pop_front() else {
+        let Some((since, id)) = self.unused.pop_first() else {
             return false;
         };
         debug_assert!(
             matches!(
                 self.peers.get(&id),
-                Some(PeerState::Ready { counter, unused_since: Some(_), .. }) if counter.is_unused()
+                Some(PeerState::Ready { counter, unused_since: Some(s), .. })
+                    if *s == since && counter.is_unused()
             ),
             "the unused list names a peer that is not unused"
         );
@@ -476,14 +479,12 @@ impl Actor {
                 };
                 self.conn_close.push(close_fut);
 
-                let unused_since = if counter.is_unused() {
+                let unused_since = counter.is_unused().then(Instant::now);
+                if let Some(since) = unused_since {
                     // Schedule an idle timer if it is already unused here.
-                    self.unused.push_back(id);
+                    self.unused.insert((since, id));
                     self.schedule_unused_timer(id);
-                    Some(Instant::now())
-                } else {
-                    None
-                };
+                }
                 self.peers.insert(
                     id,
                     PeerState::Ready {
@@ -531,9 +532,11 @@ impl Actor {
         if !counter.is_unused() {
             return;
         }
-        *unused_since = Some(Instant::now());
-        self.unused.retain(|x| *x != id);
-        self.unused.push_back(id);
+        let now = Instant::now();
+        if let Some(since) = unused_since.replace(now) {
+            self.unused.remove(&(since, id));
+        }
+        self.unused.insert((now, id));
         trace!(%id, "peer unused");
         self.schedule_unused_timer(id);
     }
@@ -569,7 +572,13 @@ impl Actor {
     }
 
     fn remove_peer(&mut self, id: EndpointId) {
-        self.unused.retain(|x| *x != id);
+        if let Some(PeerState::Ready {
+            unused_since: Some(since),
+            ..
+        }) = self.peers.get(&id)
+        {
+            self.unused.remove(&(*since, id));
+        }
         if let Some(state) = self.peers.remove(&id) {
             match state {
                 PeerState::Connecting { waiters, .. } => {
