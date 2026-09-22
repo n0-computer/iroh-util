@@ -102,7 +102,8 @@ impl Options {
 /// A reference to a connection that is owned by a connection pool.
 ///
 /// The connection counts as in use for as long as any reference to it is alive.
-#[derive(Debug)]
+/// Each clone counts, like an `Arc`.
+#[derive(Debug, Clone)]
 pub struct ConnectionRef {
     connection: iroh::endpoint::Connection,
     permit: OneConnection,
@@ -1046,6 +1047,17 @@ impl ConnectionCounter {
 #[derive(Debug)]
 struct OneConnection {
     inner: Arc<ConnectionCounterInner>,
+}
+
+impl Clone for OneConnection {
+    fn clone(&self) -> Self {
+        // The count is at least one while `self` lives, so a clone never takes
+        // a connection off the unused list behind the pool's back.
+        self.inner.count.fetch_add(1, Ordering::SeqCst);
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl Drop for OneConnection {
@@ -2370,6 +2382,24 @@ mod tests {
         let err = tokio::time::timeout(SHORT_IDLE * 10, s.first.closed()).await?;
         assert_closed_as_unused(&err);
         drop(weak);
+        Ok(())
+    }
+
+    /// A clone of a [`ConnectionRef`] keeps the connection open on its own.
+    #[tokio::test]
+    async fn cloned_ref_keeps_connection_open() -> TestResult<()> {
+        let s = Superseded::new(short_idle_options()).await?;
+        let clone = s.first_ref.clone();
+        drop(s.first_ref);
+
+        n0_future::time::sleep(SHORT_IDLE * 5).await;
+        assert!(
+            s.first.close_reason().is_none(),
+            "closed although a clone of its reference is alive"
+        );
+        drop(clone);
+        let err = tokio::time::timeout(SHORT_IDLE * 10, s.first.closed()).await?;
+        assert_closed_as_unused(&err);
         Ok(())
     }
 }
