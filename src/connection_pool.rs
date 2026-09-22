@@ -202,12 +202,14 @@ struct Actor {
     /// Inbox
     rx: mpsc::Receiver<ActorMessage>,
     /// Separate inbox for unused events, gets processed before the main inbox.
-    unused_rx: mpsc::UnboundedReceiver<EndpointId>,
+    ///
+    /// Each event names the peer and the generation of the connection.
+    unused_rx: mpsc::UnboundedReceiver<(EndpointId, u64)>,
     /// Sender for the unused inbox to be cloned into the connection counter.
     ///
     /// This is unbounded so it can be used in Drop. It holds at most one event per
     /// connection going unused, and the actor drains it before anything else.
-    unused_tx: mpsc::UnboundedSender<EndpointId>,
+    unused_tx: mpsc::UnboundedSender<(EndpointId, u64)>,
     options: Options,
     endpoint: Endpoint,
     alpn: Arc<[u8]>,
@@ -269,8 +271,8 @@ impl Actor {
                 biased;
 
                 // Handle unused events first, since this might give us some room.
-                Some(id) = self.unused_rx.recv() => {
-                    self.handle_unused_event(id);
+                Some((id, generation)) = self.unused_rx.recv() => {
+                    self.handle_unused_event(id, generation);
                 }
 
                 Some((id, generation, result)) = self.connecting.next(), if !self.connecting.is_empty() => {
@@ -460,7 +462,7 @@ impl Actor {
                 }
             }
             Ok(conn) => {
-                let counter = ConnectionCounter::new(id, self.unused_tx.clone());
+                let counter = ConnectionCounter::new(id, generation, self.unused_tx.clone());
                 for tx in waiters {
                     if tx.is_closed() {
                         continue;
@@ -523,8 +525,14 @@ impl Actor {
         }
     }
 
-    fn handle_unused_event(&mut self, id: EndpointId) {
+    /// Handles a connection going unused.
+    ///
+    /// Only acts if the connection is still the peer's current one. References
+    /// to a connection the pool replaced can outlive it, and their last drop
+    /// must not restart its successor's idle timeout.
+    fn handle_unused_event(&mut self, id: EndpointId, generation: u64) {
         let Some(PeerState::Ready {
+            generation: g,
             counter,
             unused_since,
             ..
@@ -532,6 +540,9 @@ impl Actor {
         else {
             return;
         };
+        if *g != generation {
+            return;
+        }
         // Connection was handed out in the meantime.
         if !counter.is_unused() {
             return;
@@ -638,7 +649,9 @@ impl ConnectionPool {
 struct ConnectionCounterInner {
     count: AtomicUsize,
     id: EndpointId,
-    unused_tx: mpsc::UnboundedSender<EndpointId>,
+    /// The generation of the connection, which unused events name.
+    generation: u64,
+    unused_tx: mpsc::UnboundedSender<(EndpointId, u64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -647,11 +660,16 @@ struct ConnectionCounter {
 }
 
 impl ConnectionCounter {
-    fn new(id: EndpointId, unused_tx: mpsc::UnboundedSender<EndpointId>) -> Self {
+    fn new(
+        id: EndpointId,
+        generation: u64,
+        unused_tx: mpsc::UnboundedSender<(EndpointId, u64)>,
+    ) -> Self {
         Self {
             inner: Arc::new(ConnectionCounterInner {
                 count: AtomicUsize::new(0),
                 id,
+                generation,
                 unused_tx,
             }),
         }
@@ -683,7 +701,10 @@ impl Drop for OneConnection {
     fn drop(&mut self) {
         if self.inner.count.fetch_sub(1, Ordering::SeqCst) == 1 {
             // Send an unused event to the actor.
-            let _ = self.inner.unused_tx.send(self.inner.id);
+            let _ = self
+                .inner
+                .unused_tx
+                .send((self.inner.id, self.inner.generation));
         }
     }
 }
@@ -1396,7 +1417,7 @@ mod tests {
             .await?;
         let conn = endpoint.connect(id, ECHO_ALPN).await?;
         let (mut actor, _tx) = Actor::new(endpoint.clone(), ECHO_ALPN, test_options());
-        let counter = ConnectionCounter::new(id, actor.unused_tx.clone());
+        let counter = ConnectionCounter::new(id, 1, actor.unused_tx.clone());
         actor.peers.insert(
             id,
             PeerState::Ready {
@@ -1513,6 +1534,50 @@ mod tests {
             conn.close_reason().is_some(),
             "not closed after its timeout"
         );
+
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
+
+    /// A stale unused event leaves the current connection's idle time alone.
+    ///
+    /// The event is for a connection the peer no longer has. References to a
+    /// replaced connection can outlive it, and when the last one drops, its
+    /// event names the peer, whose current connection is another.
+    #[tokio::test]
+    async fn stale_unused_event_keeps_the_idle_time() -> TestResult<()> {
+        let (ids, routers, address_lookup) = echo_servers(1).await?;
+        let id = ids[0];
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let conn = endpoint.connect(id, ECHO_ALPN).await?;
+        let (mut actor, _tx) = Actor::new(endpoint.clone(), ECHO_ALPN, test_options());
+        let counter = ConnectionCounter::new(id, 1, actor.unused_tx.clone());
+        let since = n0_future::time::Instant::now();
+        actor.unused.insert((since, id));
+        actor.peers.insert(
+            id,
+            PeerState::Ready {
+                generation: 1,
+                connection: conn,
+                counter,
+                unused_since: Some(since),
+            },
+        );
+
+        actor.handle_unused_event(id, 0);
+        assert!(
+            matches!(
+                actor.peers.get(&id),
+                Some(PeerState::Ready { unused_since: Some(s), .. }) if *s == since
+            ),
+            "a stale unused event restarted the idle timeout"
+        );
+        assert_eq!(actor.unused.first(), Some(&(since, id)));
 
         shutdown_routers(routers).await;
         endpoint.close().await;
