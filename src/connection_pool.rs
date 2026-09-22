@@ -381,11 +381,13 @@ impl Actor {
         let on_connected = self.options.on_connected.clone();
         let connect_timeout = self.options.connect_timeout;
         Box::pin(async move {
+            let mut connected = None;
             let attempt = async {
                 let conn = endpoint
                     .connect(id, &alpn[..])
                     .await
                     .map_err(PoolConnectError::from)?;
+                connected = Some(conn.clone());
                 if let Some(f) = &on_connected {
                     f(&endpoint, &conn).await.map_err(PoolConnectError::from)?;
                 }
@@ -395,6 +397,13 @@ impl Actor {
                 Ok(r) => r,
                 Err(_) => Err(e!(PoolConnectError::Timeout)),
             };
+            // `on_connected` failed or ran out of time. Close the connection
+            // rather than drop it: the callback may have handed it to a task.
+            if result.is_err()
+                && let Some(conn) = connected
+            {
+                conn.close(0u32.into(), b"on_connected failed");
+            }
             (id, generation, result)
         })
     }
@@ -1397,6 +1406,45 @@ mod tests {
         actor.handle_conn_closed(id, 1);
         assert!(!actor.peers.contains_key(&id));
 
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
+
+    /// A connection whose `on_connected` failed is closed.
+    ///
+    /// Dropping it would not be enough: the callback may keep a handle to it.
+    #[tokio::test]
+    async fn on_connected_error_closes_the_connection() -> TestResult<()> {
+        let (ids, routers, address_lookup) = echo_servers(1).await?;
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let kept = Arc::new(std::sync::Mutex::new(None));
+        let pool = ConnectionPool::new(
+            endpoint.clone(),
+            ECHO_ALPN,
+            test_options().with_on_connected({
+                let kept = kept.clone();
+                move |_, conn: Connection| {
+                    *kept.lock().expect("poisoned") = Some(conn);
+                    async { Err(io::Error::other("on_connect failed")) }
+                }
+            }),
+        );
+        let res = pool.get_or_connect(ids[0]).await;
+        assert!(matches!(res, Err(PoolConnectError::OnConnectError { .. })));
+        let conn = kept
+            .lock()
+            .expect("poisoned")
+            .take()
+            .expect("callback not called");
+        assert!(
+            conn.close_reason().is_some(),
+            "the connection stayed open after on_connected failed"
+        );
         shutdown_routers(routers).await;
         endpoint.close().await;
         Ok(())
