@@ -47,6 +47,9 @@ pub struct Options {
     /// Timeout for connect. This includes the time spent in on_connect, if set.
     pub connect_timeout: Duration,
     /// Maximum number of connections to hand out.
+    ///
+    /// Attempts to connect that are still running do not count, so attempts to
+    /// peers that do not answer cannot take the place of connections.
     pub max_connections: usize,
     /// An optional callback that can be used to wait for the connection to enter some state.
     /// An example usage could be to wait for the connection to become direct before handing
@@ -329,15 +332,9 @@ impl Actor {
             }
         }
 
-        // If we exceed max_connections, do a last attempt to make room, otherwise fail.
-        if self.peers.len() >= self.options.max_connections {
-            if let Some(id) = self.unused.pop_front() {
-                trace!("evicting oldest unused peer {id} to make room");
-                self.remove_peer_inner(id);
-            } else {
-                let _ = req.tx.send(Err(e!(PoolConnectError::TooManyConnections)));
-                return;
-            }
+        if !self.make_room() {
+            let _ = req.tx.send(Err(e!(PoolConnectError::TooManyConnections)));
+            return;
         }
 
         let generation = self.next_generation;
@@ -351,6 +348,27 @@ impl Actor {
         );
         self.connecting
             .push(self.make_connect_future(id, generation));
+    }
+
+    /// Makes room for one more connection if the pool holds `max_connections`.
+    ///
+    /// Evicts the connection that has been unused the longest, and returns
+    /// `false` if there is none.
+    fn make_room(&mut self) -> bool {
+        let connections = self
+            .peers
+            .values()
+            .filter(|state| matches!(state, PeerState::Ready { .. }))
+            .count();
+        if connections < self.options.max_connections {
+            return true;
+        }
+        let Some(id) = self.unused.pop_front() else {
+            return false;
+        };
+        trace!("evicting oldest unused peer {id} to make room");
+        self.remove_peer_inner(id);
+        true
     }
 
     fn make_connect_future(&self, id: EndpointId, generation: u64) -> Boxed<ConnectResult> {
@@ -399,6 +417,14 @@ impl Actor {
             return;
         };
         match result {
+            // Connections made since this attempt started may have filled the pool.
+            Ok(conn) if !self.make_room() => {
+                debug!(%id, "connected, but the pool is full");
+                conn.close(0u32.into(), b"too many connections");
+                for tx in waiters {
+                    let _ = tx.send(Err(e!(PoolConnectError::TooManyConnections)));
+                }
+            }
             Ok(conn) => {
                 let counter = ConnectionCounter::new(id, self.unused_tx.clone());
                 for tx in waiters {
@@ -1208,14 +1234,10 @@ mod tests {
         Ok(())
     }
 
-    /// Checks that in-flight connection attempts do not count towards
-    /// [`Options::max_connections`], so that peers we are still trying to reach
-    /// cannot starve unrelated peers of a slot.
+    /// In-flight attempts do not count towards [`Options::max_connections`].
     ///
-    /// Currently fails: `Actor::handle_request` sizes the pool with
-    /// `self.peers.len()`, and `peers` also holds `PeerState::Connecting`
-    /// entries, so `max_connections` attempts against unreachable peers make
-    /// every other peer fail with `TooManyConnections` until `connect_timeout`
+    /// Otherwise peers we are still trying to reach take every slot, and
+    /// unrelated peers fail with `TooManyConnections` until `connect_timeout`
     /// expires.
     #[tokio::test]
     async fn inflight_connects_do_not_exhaust_slots() -> TestResult<()> {
@@ -1273,6 +1295,41 @@ mod tests {
         for p in parked {
             let _ = p.await;
         }
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
+
+    /// A connection made after the pool filled up fails with `TooManyConnections`.
+    ///
+    /// Attempts no longer reserve a slot, so without a second check the pool
+    /// would go over `max_connections`.
+    #[tokio::test]
+    async fn connect_into_a_full_pool_fails() -> TestResult<()> {
+        let (ids, routers, address_lookup) = echo_servers(2).await?;
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let pool = ConnectionPool::new(
+            endpoint.clone(),
+            ECHO_ALPN,
+            Options {
+                max_connections: 1,
+                ..test_options()
+            },
+        );
+        // Both attempts start before either connection exists.
+        let (a, b) = tokio::join!(pool.get_or_connect(ids[0]), pool.get_or_connect(ids[1]));
+        let full = |res: &Result<_, PoolConnectError>| {
+            matches!(res, Err(PoolConnectError::TooManyConnections { .. }))
+        };
+        assert!(
+            (a.is_ok() && full(&b)) || (full(&a) && b.is_ok()),
+            "expected one connection and one TooManyConnections: {a:?}, {b:?}"
+        );
+        drop((a, b));
         shutdown_routers(routers).await;
         endpoint.close().await;
         Ok(())
