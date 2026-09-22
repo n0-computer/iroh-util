@@ -10,6 +10,7 @@
 //! the connection.
 //!
 //! This is using a single actor to manage all connections.
+
 use std::{
     collections::{BTreeSet, HashMap},
     io,
@@ -26,7 +27,7 @@ use iroh::{
 };
 use n0_error::{e, stack_error};
 use n0_future::{
-    FuturesUnordered, StreamExt,
+    FuturesUnordered, MaybeFuture, StreamExt,
     future::Boxed,
     time::{Duration, Instant},
 };
@@ -45,8 +46,7 @@ pub struct Options {
     /// How long to keep unused connections around.
     ///
     /// Idle here means that there are no [`ConnectionRef`]s alive for the connection,
-    /// not that the connection itself is idle. Such connections are closed with
-    /// the reason `unused`.
+    /// not that the connection itself is idle.
     pub idle_timeout: Duration,
     /// Timeout for connect. This includes the time spent in on_connect, if set.
     pub connect_timeout: Duration,
@@ -108,10 +108,10 @@ impl Deref for ConnectionRef {
 }
 
 impl ConnectionRef {
-    fn new(connection: iroh::endpoint::Connection, counter: OneConnection) -> Self {
+    fn new(connection: iroh::endpoint::Connection, permit: OneConnection) -> Self {
         Self {
             connection,
-            _permit: counter,
+            _permit: permit,
         }
     }
 }
@@ -224,7 +224,7 @@ struct Actor {
     ///
     /// Keyed by each peer's `unused_since`, so a peer's entry can be found and
     /// removed without a scan. The first entry is the next connection to close
-    /// for being unused, so the actor needs a single timer, set for it.
+    /// for being unused.
     unused: BTreeSet<(Instant, EndpointId)>,
 }
 
@@ -258,10 +258,13 @@ impl Actor {
         // We bias processing internal events before accepting more work from
         // the external mailbox.
         loop {
-            let next_unused_timer_at = self
-                .unused
-                .first()
-                .map(|(since, _)| *since + self.options.idle_timeout);
+            let next_unused_timer_at = match self.unused.first() {
+                None => MaybeFuture::None,
+                Some((unused_since, _endpoint_id)) => {
+                    let deadline = *unused_since + self.options.idle_timeout;
+                    MaybeFuture::Some(n0_future::time::sleep_until(deadline))
+                }
+            };
             tokio::select! {
                 biased;
 
@@ -278,14 +281,7 @@ impl Actor {
                     self.handle_conn_closed(id, generation);
                 }
 
-                _ = async {
-                    match next_unused_timer_at {
-                        Some(at) => n0_future::time::sleep_until(at).await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    self.close_unused();
-                }
+                _ = next_unused_timer_at => self.close_unused(),
 
                 msg = self.rx.recv() => {
                     let Some(msg) = msg else { break };
@@ -469,8 +465,11 @@ impl Actor {
                     if tx.is_closed() {
                         continue;
                     }
-                    let one = counter.get_one();
-                    if tx.send(Ok(ConnectionRef::new(conn.clone(), one))).is_err() {
+                    let permit = counter.get_one();
+                    if tx
+                        .send(Ok(ConnectionRef::new(conn.clone(), permit)))
+                        .is_err()
+                    {
                         // User is no longer interested in the ConnectionRef.
                     }
                 }
@@ -558,13 +557,6 @@ impl Actor {
     }
 
     fn remove_peer(&mut self, id: EndpointId) {
-        if let Some(PeerState::Ready {
-            unused_since: Some(since),
-            ..
-        }) = self.peers.get(&id)
-        {
-            self.unused.remove(&(*since, id));
-        }
         if let Some(state) = self.peers.remove(&id) {
             match state {
                 PeerState::Connecting { waiters, .. } => {
@@ -575,6 +567,7 @@ impl Actor {
                 PeerState::Ready {
                     connection,
                     counter,
+                    unused_since,
                     ..
                 } => {
                     let reason: &[u8] = if counter.is_unused() {
@@ -583,6 +576,9 @@ impl Actor {
                         b"drop"
                     };
                     connection.close(0u32.into(), reason);
+                    if let Some(since) = unused_since {
+                        self.unused.remove(&(since, id));
+                    }
                 }
             }
         }
