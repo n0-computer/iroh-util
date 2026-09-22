@@ -42,7 +42,8 @@ pub struct Options {
     /// How long to keep unused connections around.
     ///
     /// Idle here means that there are no [`ConnectionRef`]s alive for the connection,
-    /// not that the connection itself is idle.
+    /// not that the connection itself is idle. Such connections are closed with
+    /// the reason `unused`.
     pub idle_timeout: Duration,
     /// Timeout for connect. This includes the time spent in on_connect, if set.
     pub connect_timeout: Duration,
@@ -54,6 +55,9 @@ pub struct Options {
     /// An optional callback that can be used to wait for the connection to enter some state.
     /// An example usage could be to wait for the connection to become direct before handing
     /// it out to the user.
+    ///
+    /// It runs on the pool's task, so it must not block the thread: that would
+    /// stall the whole pool.
     #[debug(skip)]
     pub on_connected: Option<OnConnected>,
 }
@@ -119,6 +123,7 @@ pub enum PoolConnectError {
     /// Connection pool is shut down
     #[error("Connection pool is shut down")]
     Shutdown {},
+    /// Connection attempt was cancelled by [`ConnectionPool::close`]
     #[error("Connection was closed")]
     Closed {},
     /// Timeout during connect
@@ -197,8 +202,8 @@ struct Actor {
     unused_rx: mpsc::UnboundedReceiver<EndpointId>,
     /// Sender for the unused inbox to be cloned into the connection counter.
     ///
-    /// This is unbounded so it can be used in Drop, but it is bounded by the number
-    /// of ConnectionRefs we give out, which is bounded by max_connections.
+    /// This is unbounded so it can be used in Drop. It holds at most one event per
+    /// connection going unused, and the actor drains it before anything else.
     unused_tx: mpsc::UnboundedSender<EndpointId>,
     options: Options,
     endpoint: Endpoint,
@@ -370,8 +375,15 @@ impl Actor {
         let Some(id) = self.unused.pop_front() else {
             return false;
         };
+        debug_assert!(
+            matches!(
+                self.peers.get(&id),
+                Some(PeerState::Ready { counter, unused_since: Some(_), .. }) if counter.is_unused()
+            ),
+            "the unused list names a peer that is not unused"
+        );
         trace!("evicting oldest unused peer {id} to make room");
-        self.remove_peer_inner(id);
+        self.remove_peer(id);
         true
     }
 
@@ -539,7 +551,7 @@ impl Actor {
             ..
         }) = self.peers.get(&id)
         else {
-            // PeerState is no longer what we expect. Either mising entirely
+            // PeerState is no longer what we expect. Either missing entirely
             // or Connecting. In either case, we must not do anything.
             return;
         };
@@ -549,15 +561,11 @@ impl Actor {
         let Some(since) = unused_since else { return };
         if since.elapsed() >= self.options.idle_timeout {
             trace!(%id, "unused timeout, removing");
-            self.remove_peer_inner(id);
+            self.remove_peer(id);
         }
     }
 
     fn remove_peer(&mut self, id: EndpointId) {
-        self.remove_peer_inner(id);
-    }
-
-    fn remove_peer_inner(&mut self, id: EndpointId) {
         self.unused.retain(|x| *x != id);
         if let Some(state) = self.peers.remove(&id) {
             match state {
@@ -584,6 +592,10 @@ impl Actor {
 }
 
 /// A connection pool
+///
+/// Dropping the last handle stops the pool and closes its connections, including
+/// ones that are still in use. If the pool's task panics, every call fails with
+/// [`PoolConnectError::Shutdown`] or [`ConnectionPoolError::Shutdown`].
 #[derive(Debug, Clone)]
 pub struct ConnectionPool {
     tx: mpsc::Sender<ActorMessage>,
@@ -599,7 +611,8 @@ impl ConnectionPool {
     /// Returns either a fresh connection or a reference to an existing one.
     ///
     /// This is guaranteed to return after approximately [Options::connect_timeout]
-    /// with either an error or a connection.
+    /// with either an error or a connection, plus the time the request waits in
+    /// the pool's inbox.
     pub async fn get_or_connect(
         &self,
         id: EndpointId,
@@ -614,8 +627,10 @@ impl ConnectionPool {
 
     /// Close an existing connection, if it exists
     ///
-    /// This will finish pending tasks and close the connection. New tasks will
-    /// get a new connection if they are submitted after this call
+    /// The connection is closed right away, with the reason `drop` if it is still
+    /// in use. Requests waiting for the connection to be made fail with
+    /// [`PoolConnectError::Closed`]. Requests made after this call get a new
+    /// connection.
     pub async fn close(&self, id: EndpointId) -> std::result::Result<(), ConnectionPoolError> {
         self.tx
             .send(ActorMessage::ConnectionShutdown { id })
