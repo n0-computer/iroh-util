@@ -2350,16 +2350,21 @@ mod tests {
         }
     }
 
-    /// Asserts that the pool closed a connection because it was unused.
-    fn assert_closed_as_unused(err: &iroh::endpoint::ConnectionError) {
+    /// Asserts that the pool closed a connection with `reason`.
+    fn assert_closed_as(err: &iroh::endpoint::ConnectionError, reason: &[u8]) {
         assert!(
             matches!(
                 err,
                 iroh::endpoint::ConnectionError::ApplicationClosed(frame)
-                    if &frame.reason[..] == b"unused"
+                    if frame.reason[..] == *reason
             ),
             "closed for the wrong reason: {err:?}"
         );
+    }
+
+    /// Asserts that the pool closed a connection because it was unused.
+    fn assert_closed_as_unused(err: &iroh::endpoint::ConnectionError) {
+        assert_closed_as(err, b"unused");
     }
 
     fn short_idle_options() -> Options {
@@ -2367,6 +2372,258 @@ mod tests {
             idle_timeout: SHORT_IDLE,
             ..Default::default()
         }
+    }
+
+    /// Connects `client` to `server` and returns both ends.
+    ///
+    /// The pool is not told about the connection: a test that hands it over
+    /// itself decides when that happens.
+    async fn connect_pair(
+        client: &iroh::Endpoint,
+        server: &iroh::Endpoint,
+    ) -> TestResult<(Connection, Connection)> {
+        let (outgoing, incoming) =
+            tokio::join!(client.connect(server.addr(), INCOMING_ALPN), async {
+                server.accept().await.expect("endpoint closed").await
+            });
+        Ok((outgoing?, incoming?))
+    }
+
+    /// Binds a server endpoint that accepts [`INCOMING_ALPN`].
+    async fn incoming_server() -> TestResult<iroh::Endpoint> {
+        let server = iroh::Endpoint::builder(presets::Minimal)
+            .alpns(vec![INCOMING_ALPN.to_vec()])
+            .bind()
+            .await?;
+        Ok(server)
+    }
+
+    /// An `on_connected` callback that takes `delay` and counts its calls.
+    fn slow_on_connected(delay: Duration) -> (Options, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let options = short_idle_options().with_on_connected({
+            let calls = calls.clone();
+            move |_ep, _conn: ConnectionRef| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    n0_future::time::sleep(delay).await;
+                    Ok(())
+                }
+            }
+        });
+        (options, calls)
+    }
+
+    /// A full pool does not adopt a connection from a peer it is dialing.
+    ///
+    /// A dial holds no slot, so the room check has to run when the adoption
+    /// finishes, whatever state the peer is in.
+    #[tokio::test]
+    async fn adopting_for_a_dialing_peer_respects_max_connections() -> TestResult<()> {
+        let server = incoming_server().await?;
+        let first = iroh::Endpoint::bind(presets::Minimal).await?;
+        let second = iroh::Endpoint::bind(presets::Minimal).await?;
+        // A socket that absorbs packets: the pool's dial to `second` runs until
+        // the connect timeout, so `second` stays in the pool as connecting.
+        let (_dead_sock, dead) = dead_addr()?;
+        let lookup = MemoryLookup::new();
+        lookup.add_endpoint_info(EndpointAddr::from_parts(second.id(), [dead]));
+        server.address_lookup()?.add(lookup);
+        let options = Options {
+            max_connections: 1,
+            connect_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let pool = ConnectionPool::new(server.clone(), INCOMING_ALPN, options);
+
+        // A dial started while the pool has room, and that does not finish.
+        let dial = tokio::spawn({
+            let pool = pool.clone();
+            let id = second.id();
+            async move { pool.get_or_connect(id).await }
+        });
+        n0_future::time::sleep(Duration::from_millis(300)).await;
+        assert!(!dial.is_finished(), "the dial finished early");
+
+        // The pool fills up: one connection, held in use.
+        let (first_conn, _first_ref) = Superseded::connect(&first, &server, &pool).await?;
+
+        // `second` dials us while the pool is dialing it, and is full.
+        let (outgoing, incoming) = connect_pair(&second, &server).await?;
+        let adopted = pool.handle_connection(incoming).await;
+        assert!(
+            matches!(adopted, Err(PoolConnectError::TooManyConnections { .. })),
+            "adopted into a full pool: {adopted:?}"
+        );
+        assert!(
+            first_conn.close_reason().is_none(),
+            "the connection in use was closed"
+        );
+        drop(outgoing);
+        dial.abort();
+        server.close().await;
+        Ok(())
+    }
+
+    /// Handing the pool a connection it is already adopting waits for that.
+    ///
+    /// Adopting it twice would give one connection two generations and two
+    /// reference counts, and closing either would close the other.
+    #[tokio::test]
+    async fn adopting_one_connection_twice_waits_for_the_first() -> TestResult<()> {
+        let (options, calls) = slow_on_connected(Duration::from_millis(300));
+        let server = incoming_server().await?;
+        let client = iroh::Endpoint::bind(presets::Minimal).await?;
+        let pool = ConnectionPool::new(server.clone(), INCOMING_ALPN, options);
+        let (outgoing, incoming) = connect_pair(&client, &server).await?;
+
+        let (first, second) = tokio::join!(
+            pool.handle_connection(incoming.clone()),
+            pool.handle_connection(incoming.clone()),
+        );
+        let (first, second) = (first?, second?);
+        assert_eq!(first.stable_id(), second.stable_id(), "not one connection");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "adopted twice");
+        assert!(!first.is_superseded(), "superseded by itself");
+
+        // The pool holds one connection, so letting go of one reference does
+        // not close what the other still uses.
+        drop(first);
+        n0_future::time::sleep(SHORT_IDLE * 5).await;
+        assert!(
+            outgoing.close_reason().is_none(),
+            "closed a connection that is in use: {:?}",
+            outgoing.close_reason()
+        );
+        drop(second);
+        server.close().await;
+        Ok(())
+    }
+
+    /// Handing the pool a connection it superseded returns a reference to it.
+    ///
+    /// The peer may still be using it, which is why the pool kept it, so this
+    /// is not a reason to make it current again.
+    #[tokio::test]
+    async fn adopting_a_superseded_connection_returns_it() -> TestResult<()> {
+        let s = Superseded::new(short_idle_options()).await?;
+        let superseded = (*s.first_ref).clone();
+
+        let again = s.pool.handle_connection(superseded).await?;
+        assert_eq!(again.stable_id(), s.first_ref.stable_id());
+        assert!(
+            again.is_superseded(),
+            "made a superseded connection current"
+        );
+        let current = s.pool.get_or_connect(s.first_ref.remote_id()).await?;
+        assert_eq!(
+            current.stable_id(),
+            s.second_ref.stable_id(),
+            "the current connection changed"
+        );
+        s.server.close().await;
+        Ok(())
+    }
+
+    /// A request waits for an adoption that is running.
+    ///
+    /// The adopted connection becomes the current one, so dialing as well would
+    /// make a connection that it supersedes right away.
+    #[tokio::test]
+    async fn a_request_waits_for_a_running_adoption() -> TestResult<()> {
+        let (options, calls) = slow_on_connected(Duration::from_millis(300));
+        let server = incoming_server().await?;
+        let client = iroh::Endpoint::bind(presets::Minimal).await?;
+        let pool = ConnectionPool::new(server.clone(), INCOMING_ALPN, options);
+        let (_outgoing, incoming) = connect_pair(&client, &server).await?;
+        let adopting = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.handle_connection(incoming).await }
+        });
+        n0_future::time::sleep(Duration::from_millis(50)).await;
+
+        // The pool has no address for the client, so a dial would fail.
+        let requested = pool.get_or_connect(client.id()).await?;
+        let adopted = adopting.await??;
+        assert_eq!(requested.stable_id(), adopted.stable_id());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the request dialed as well"
+        );
+        server.close().await;
+        Ok(())
+    }
+
+    /// Closing a peer closes the connection of an attempt that is running.
+    ///
+    /// The attempt itself runs to its end, so waiting for that would leave the
+    /// connection open for as long as `on_connected` takes.
+    #[tokio::test]
+    async fn close_closes_the_connection_of_a_running_attempt() -> TestResult<()> {
+        let (options, _calls) = slow_on_connected(Duration::from_secs(10));
+        let options = Options {
+            connect_timeout: Duration::from_secs(30),
+            ..options
+        };
+        let server = incoming_server().await?;
+        let client = iroh::Endpoint::bind(presets::Minimal).await?;
+        let pool = ConnectionPool::new(server.clone(), INCOMING_ALPN, options);
+        let (outgoing, incoming) = connect_pair(&client, &server).await?;
+        let adopting = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.handle_connection(incoming).await }
+        });
+        n0_future::time::sleep(Duration::from_millis(100)).await;
+
+        pool.close(client.id()).await?;
+        let err = tokio::time::timeout(Duration::from_secs(5), outgoing.closed()).await?;
+        assert_closed_as(&err, b"closed");
+        let adopted = adopting.await?;
+        assert!(
+            matches!(adopted, Err(PoolConnectError::Closed { .. })),
+            "the caller was not told: {adopted:?}"
+        );
+        server.close().await;
+        Ok(())
+    }
+
+    /// The pool keeps at most `max_superseded_per_peer` superseded connections.
+    ///
+    /// A peer that opens connections in a loop would otherwise make the pool
+    /// hold one per attempt, each until it goes unused.
+    #[tokio::test]
+    async fn superseded_connections_are_capped() -> TestResult<()> {
+        let options = Options {
+            max_superseded_per_peer: 1,
+            ..short_idle_options()
+        };
+        let server = incoming_server().await?;
+        let client = iroh::Endpoint::bind(presets::Minimal).await?;
+        let pool = ConnectionPool::new(server.clone(), INCOMING_ALPN, options);
+
+        let mut connections = Vec::new();
+        let mut refs = Vec::new();
+        for _ in 0..3 {
+            let (outgoing, conn_ref) = Superseded::connect(&client, &server, &pool).await?;
+            connections.push(outgoing);
+            // Hold each one, so nothing closes for being unused.
+            refs.push(conn_ref);
+        }
+
+        let err = tokio::time::timeout(SHORT_IDLE * 5, connections[0].closed()).await?;
+        assert_closed_as(&err, b"drop");
+        assert!(
+            connections[1].close_reason().is_none(),
+            "closed the connection within the cap"
+        );
+        assert!(
+            connections[2].close_reason().is_none(),
+            "closed the current connection"
+        );
+        server.close().await;
+        Ok(())
     }
 
     /// An incoming connection becomes the one `get_or_connect` returns.
