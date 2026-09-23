@@ -337,6 +337,7 @@ struct PooledConnection {
 }
 
 impl PooledConnection {
+    /// Pairs a connection with the counter that was made for it.
     fn new(connection: Connection, counter: ConnectionCounter) -> Self {
         Self {
             connection,
@@ -1110,18 +1111,16 @@ impl Actor {
             adopting,
             superseded,
         } = peer;
-        let attempts = match current {
-            Some(Current::Ready(conn)) => {
-                self.release(&conn);
-                None
-            }
-            Some(Current::Connecting(attempt)) => Some(attempt),
-            None => None,
-        };
+        let mut attempts = adopting;
+        match current {
+            Some(Current::Ready(conn)) => self.release(&conn),
+            Some(Current::Connecting(attempt)) => attempts.push(attempt),
+            None => {}
+        }
         for conn in &superseded {
             self.release(conn);
         }
-        for attempt in attempts.into_iter().chain(adopting) {
+        for attempt in attempts {
             // The connection an attempt has made is closed here. The attempt
             // runs to its end, and its result is discarded when it arrives.
             attempt.close_as(b"closed");
