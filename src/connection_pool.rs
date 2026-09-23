@@ -328,6 +328,15 @@ impl Actor {
 
     fn handle_request(&mut self, req: RequestRef) {
         let id = req.id;
+        // A connection that closed a moment ago is still the peer's current one
+        // until its close event reaches the actor. Handing it out would give the
+        // caller a connection that fails on first use.
+        if let Some(PeerState::Ready { connection, .. }) = self.peers.get(&id)
+            && connection.close_reason().is_some()
+        {
+            debug!(%id, "current connection has closed, dialing again");
+            self.remove_peer(id);
+        }
         if let Some(state) = self.peers.get_mut(&id) {
             match state {
                 PeerState::Connecting { waiters, .. } => {
@@ -729,10 +738,12 @@ mod tests {
     use n0_error::{AnyError, Result, StdResultExt};
     use n0_future::{BufferedStreamExt, StreamExt, io, stream};
     use testresult::TestResult;
+    use tokio::sync::oneshot;
     use tracing::trace;
 
     use super::{
-        Actor, ConnectionCounter, ConnectionPool, OnConnected, Options, PeerState, PoolConnectError,
+        Actor, ConnectionCounter, ConnectionPool, OnConnected, Options, PeerState,
+        PoolConnectError, RequestRef,
     };
 
     const ECHO_ALPN: &[u8] = b"echo";
@@ -1439,6 +1450,52 @@ mod tests {
         );
         actor.handle_conn_closed(id, 1);
         assert!(!actor.peers.contains_key(&id));
+
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
+
+    /// A connection that has closed is not handed out.
+    ///
+    /// The pool learns of a close through a watcher, so a connection can be
+    /// closed while it is still the peer's current one. A request that lands in
+    /// that window gets a new connection.
+    #[tokio::test]
+    async fn closed_connection_is_not_handed_out() -> TestResult<()> {
+        let (ids, routers, address_lookup) = echo_servers(1).await?;
+        let id = ids[0];
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let conn = endpoint.connect(id, ECHO_ALPN).await?;
+        let (mut actor, _tx) = Actor::new(endpoint.clone(), ECHO_ALPN, test_options());
+        let counter = ConnectionCounter::new(id, 1, actor.unused_tx.clone());
+        actor.peers.insert(
+            id,
+            PeerState::Ready {
+                generation: 1,
+                connection: conn.clone(),
+                counter,
+                unused_since: None,
+            },
+        );
+        // The pool has not handled the close event yet.
+        conn.close(0u32.into(), b"gone");
+        conn.closed().await;
+
+        let (tx, mut rx) = oneshot::channel();
+        actor.handle_request(RequestRef { id, tx });
+        assert!(
+            rx.try_recv().is_err(),
+            "the closed connection was handed out"
+        );
+        assert!(
+            matches!(actor.peers.get(&id), Some(PeerState::Connecting { .. })),
+            "the request did not start a new connection"
+        );
 
         shutdown_routers(routers).await;
         endpoint.close().await;
