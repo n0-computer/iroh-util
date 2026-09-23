@@ -16,7 +16,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
-    io,
+    fmt, io,
     ops::Deref,
     sync::{
         Arc,
@@ -35,7 +35,7 @@ use n0_future::{
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info, trace};
+use tracing::{debug, trace};
 
 pub type OnConnected = Arc<
     dyn Fn(&Endpoint, &ConnectionRef) -> n0_future::future::Boxed<io::Result<()>> + Send + Sync,
@@ -54,11 +54,18 @@ pub struct Options {
     pub idle_timeout: Duration,
     /// Timeout for connect. This includes the time spent in on_connect, if set.
     pub connect_timeout: Duration,
-    /// Maximum number of connections to hand out.
+    /// Maximum number of connections the pool holds.
     ///
-    /// Attempts to connect that are still running do not count, so attempts to
+    /// Connections a newer one superseded count, since they stay open until
+    /// they are unused. Attempts that are still running do not, so attempts to
     /// peers that do not answer cannot take the place of connections.
     pub max_connections: usize,
+    /// Maximum number of superseded connections to keep per peer.
+    ///
+    /// A connection the peer superseded stays open while the peer uses it, so a
+    /// peer that opens connections in a loop would make the pool hold one per
+    /// attempt. Beyond this many, the oldest are closed, in use or not.
+    pub max_superseded_per_peer: usize,
     /// An optional callback that can be used to wait for the connection to enter some state.
     /// An example usage could be to wait for the connection to become direct before handing
     /// it out to the user.
@@ -88,6 +95,7 @@ impl Default for Options {
             idle_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(1),
             max_connections: 1024,
+            max_superseded_per_peer: 2,
             on_connected: None,
         }
     }
@@ -139,7 +147,7 @@ impl ConnectionRef {
     /// returns: the old one may lead to an endpoint that has since restarted,
     /// dead without us having noticed yet.
     pub fn is_superseded(&self) -> bool {
-        self.permit.inner.superseded.load(Ordering::SeqCst)
+        self.permit.is_superseded()
     }
 
     /// Returns a reference to the connection that does not keep it in use.
@@ -169,6 +177,13 @@ impl ConnectionRef {
 /// keep the connection open upgrades it, and that includes serving streams the
 /// remote opened: the remote may keep using a connection the pool has
 /// superseded.
+///
+/// What you reach through the deref is not counted as a use, so the pool can
+/// close the connection while you use it: accepting a stream on a
+/// `WeakConnectionRef` is how an accept loop waits for work, and serving that
+/// stream belongs after [`Self::upgrade`]. Closing the connection through the
+/// deref goes behind the pool's back, which leaves the pool handing it out
+/// until its close event arrives. Use [`ConnectionPool::close`] instead.
 #[derive(Debug, Clone)]
 pub struct WeakConnectionRef {
     connection: Connection,
@@ -195,6 +210,13 @@ impl WeakConnectionRef {
         }
         let permit = self.counter.try_get_one()?;
         Some(ConnectionRef::new(self.connection.clone(), permit))
+    }
+
+    /// Returns whether a newer connection to the same endpoint superseded this one.
+    ///
+    /// See [`ConnectionRef::is_superseded`].
+    pub fn is_superseded(&self) -> bool {
+        self.counter.is_superseded()
     }
 }
 
@@ -263,83 +285,347 @@ struct RequestRef {
     tx: RefSender,
 }
 
-/// State for a peer in the connection pool
-enum PeerState {
-    /// We are currently connecting to this peer.
-    Connecting {
-        generation: u64,
-        /// Waiters that need to be notified when the connection is established or fails.
-        waiters: Vec<RefSender>,
-    },
-    /// We have a connection to the peer.
-    Ready {
-        /// The generation of the attempt that made the connection.
-        generation: u64,
-        connection: Connection,
-        counter: ConnectionCounter,
-        unused_since: Option<Instant>,
-    },
+/// An event about a connection, handled before the messages in the inbox.
+///
+/// Acting on these first keeps the pool's view of its connections current,
+/// which is what the decisions it makes for a message depend on.
+#[derive(Debug)]
+enum Event {
+    /// The connection has no references left.
+    Unused(ConnId),
+    /// An attempt has made its connection, before `on_connected` runs.
+    ///
+    /// The pool keeps it so that it can close the connection while the attempt
+    /// is still running.
+    Connected(ConnId, Connection),
 }
 
-/// A connection that a newer one to the same peer took the place of.
+/// Which attempt to a peer made a connection.
 ///
-/// The peer may still be using it, so it stays open until it is unused for
-/// [`Options::idle_timeout`], as a current connection would.
-struct Superseded {
+/// Connections to a peer come and go, and an event about one can arrive after
+/// the pool has moved on. The generation tells them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Generation(u64);
+
+impl Generation {
+    /// Returns the generation, and moves `self` on to the next one.
+    fn next(&mut self) -> Self {
+        let current = *self;
+        self.0 += 1;
+        current
+    }
+}
+
+/// Identifies one connection: the peer, and the attempt that made it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct ConnId {
+    peer: EndpointId,
+    generation: Generation,
+}
+
+impl fmt::Display for ConnId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}#{}", self.peer.fmt_short(), self.generation.0)
+    }
+}
+
+/// A connection the pool holds, with its reference count.
+#[derive(Debug, Clone)]
+struct PooledConnection {
     connection: Connection,
     counter: ConnectionCounter,
-    unused_since: Option<Instant>,
 }
 
-/// The result of a connect attempt: a dial, or adopting an incoming connection.
-type ConnectResult = (
-    EndpointId,
-    u64,
-    Result<(Connection, ConnectionCounter), PoolConnectError>,
-);
+impl PooledConnection {
+    fn new(connection: Connection, counter: ConnectionCounter) -> Self {
+        Self {
+            connection,
+            counter,
+        }
+    }
+
+    /// Returns which connection this is.
+    fn conn_id(&self) -> ConnId {
+        self.counter.conn_id()
+    }
+
+    /// Returns a reference that counts as a use of the connection.
+    fn conn_ref(&self) -> ConnectionRef {
+        ConnectionRef::new(self.connection.clone(), self.counter.get_one())
+    }
+
+    /// Returns whether nothing uses the connection.
+    fn is_unused(&self) -> bool {
+        self.counter.is_unused()
+    }
+
+    /// Closes the connection, with a reason that says whether it was in use.
+    ///
+    /// The reason is `unused` if nothing uses it, and `drop` otherwise.
+    fn close(&self) {
+        let reason: &[u8] = if self.is_unused() { b"unused" } else { b"drop" };
+        self.close_as(reason);
+    }
+
+    /// Closes the connection with `reason`, and fails later upgrades to it.
+    fn close_as(&self, reason: &[u8]) {
+        self.counter.mark_closed();
+        self.connection.close(0u32.into(), reason);
+    }
+
+    /// Closes the connection if nothing uses it, and returns whether it did.
+    ///
+    /// Upgrading a [`WeakConnectionRef`] does not go through the pool, so a
+    /// connection the pool thinks is unused may be in use again. The counter
+    /// decides the race: whichever of the two comes first wins.
+    fn close_if_unused(&self) -> bool {
+        let closed = self.counter.try_close_unused();
+        if closed {
+            self.connection.close(0u32.into(), b"unused");
+        }
+        closed
+    }
+}
+
+/// An attempt to get a connection to a peer.
+///
+/// The attempt is a dial, or the adoption of a connection the peer opened. Both
+/// run [`Options::on_connected`] before the connection is handed out.
+#[derive(Debug)]
+struct Attempt {
+    generation: Generation,
+    /// The reference count of the connection the attempt will produce.
+    counter: ConnectionCounter,
+    /// The connection, once the attempt has one.
+    ///
+    /// An adoption has it from the start, and a dial reports it before
+    /// `on_connected` runs, so the pool can close the connection while the
+    /// attempt is still running.
+    connection: Option<Connection>,
+    /// Who is waiting for the connection.
+    waiters: Vec<RefSender>,
+}
+
+impl Attempt {
+    /// Fails every waiter with `cause`.
+    fn fail(self, cause: PoolConnectError) {
+        for tx in self.waiters {
+            let _ = tx.send(Err(cause.clone()));
+        }
+    }
+
+    /// Closes the connection the attempt has made, if it has one.
+    ///
+    /// The attempt itself runs until it finishes, and its result is discarded.
+    fn close_as(&self, reason: &[u8]) {
+        if let Some(connection) = &self.connection {
+            self.counter.mark_closed();
+            connection.close(0u32.into(), reason);
+        }
+    }
+}
+
+/// The peer's current connection, or the attempt that will produce it.
+#[derive(Debug)]
+enum Current {
+    Connecting(Attempt),
+    Ready(PooledConnection),
+}
+
+/// Everything the pool holds for one peer.
+#[derive(Debug, Default)]
+struct Peer {
+    /// The connection requests get, or the attempt that will make it.
+    current: Option<Current>,
+    /// Connections the peer opened that the pool is adopting, oldest first.
+    ///
+    /// The current connection keeps serving requests until one is adopted.
+    adopting: Vec<Attempt>,
+    /// Connections that a newer one took the place of, oldest first.
+    ///
+    /// The peer may still be using one, so it stays open until it is unused
+    /// for [`Options::idle_timeout`], as a current connection would.
+    superseded: Vec<PooledConnection>,
+}
+
+impl Peer {
+    /// Returns whether the pool holds nothing for the peer any more.
+    fn is_empty(&self) -> bool {
+        self.current.is_none() && self.adopting.is_empty() && self.superseded.is_empty()
+    }
+
+    /// Returns the peer's current connection.
+    fn ready(&self) -> Option<&PooledConnection> {
+        match &self.current {
+            Some(Current::Ready(conn)) => Some(conn),
+            _ => None,
+        }
+    }
+
+    /// Returns the connection with `conn_id`, current or superseded.
+    fn connection(&self, conn_id: ConnId) -> Option<&PooledConnection> {
+        self.ready()
+            .into_iter()
+            .chain(&self.superseded)
+            .find(|conn| conn.conn_id() == conn_id)
+    }
+
+    /// Returns the connection the pool holds for `connection`, if it has it.
+    ///
+    /// Connections are compared by their stable id, which is unique among the
+    /// connections that are open.
+    fn held_connection(&self, connection: &Connection) -> Option<&PooledConnection> {
+        self.ready()
+            .into_iter()
+            .chain(&self.superseded)
+            .find(|conn| conn.connection.stable_id() == connection.stable_id())
+    }
+
+    /// Returns the adoption of `connection` that is running, if there is one.
+    fn adoption_mut(&mut self, connection: &Connection) -> Option<&mut Attempt> {
+        self.adopting.iter_mut().find(|attempt| {
+            attempt
+                .connection
+                .as_ref()
+                .is_some_and(|held| held.stable_id() == connection.stable_id())
+        })
+    }
+
+    /// Returns the attempt whose connection becomes the peer's current one.
+    ///
+    /// That is the dial that is running, or else the newest adoption, whose
+    /// connection supersedes whatever the peer has when it is adopted.
+    fn pending_mut(&mut self) -> Option<&mut Attempt> {
+        match &mut self.current {
+            Some(Current::Connecting(attempt)) => Some(attempt),
+            _ => self.adopting.last_mut(),
+        }
+    }
+
+    /// Returns the attempt with `generation`, a dial or an adoption.
+    fn attempt_mut(&mut self, generation: Generation) -> Option<&mut Attempt> {
+        let dial = match &mut self.current {
+            Some(Current::Connecting(attempt)) => Some(attempt),
+            _ => None,
+        };
+        dial.into_iter()
+            .chain(&mut self.adopting)
+            .find(|attempt| attempt.generation == generation)
+    }
+
+    /// Removes the connection with `conn_id`, current or superseded.
+    fn remove_connection(&mut self, conn_id: ConnId) -> Option<PooledConnection> {
+        let is_current = |current: &mut Current| matches!(current, Current::Ready(conn) if conn.conn_id() == conn_id);
+        if let Some(Current::Ready(conn)) = self.current.take_if(is_current) {
+            return Some(conn);
+        }
+        let index = self
+            .superseded
+            .iter()
+            .position(|conn| conn.conn_id() == conn_id)?;
+        Some(self.superseded.remove(index))
+    }
+
+    /// Removes the attempt with `generation`, a dial or an adoption.
+    fn remove_attempt(&mut self, generation: Generation) -> Option<Attempt> {
+        let is_attempt = |current: &mut Current| matches!(current, Current::Connecting(attempt) if attempt.generation == generation);
+        if let Some(Current::Connecting(attempt)) = self.current.take_if(is_attempt) {
+            return Some(attempt);
+        }
+        let index = self
+            .adopting
+            .iter()
+            .position(|attempt| attempt.generation == generation)?;
+        Some(self.adopting.remove(index))
+    }
+}
+
+/// The connections nothing uses, in the order they went unused.
+///
+/// The pool closes a connection once it has been unused for
+/// [`Options::idle_timeout`], and evicts the one that has been unused longest
+/// to make room. Entries are keyed both ways, so a connection's entry can be
+/// found and removed without a scan.
+#[derive(Debug, Default)]
+struct IdleSet {
+    since: HashMap<ConnId, Instant>,
+    order: BTreeSet<(Instant, ConnId)>,
+}
+
+impl IdleSet {
+    /// Records that the connection went unused at `now`.
+    fn insert(&mut self, conn_id: ConnId, now: Instant) {
+        self.remove(conn_id);
+        self.since.insert(conn_id, now);
+        self.order.insert((now, conn_id));
+    }
+
+    /// Removes the connection's entry, if it has one.
+    fn remove(&mut self, conn_id: ConnId) {
+        if let Some(since) = self.since.remove(&conn_id) {
+            self.order.remove(&(since, conn_id));
+        }
+    }
+
+    /// Returns when the connection that has been unused longest went unused.
+    fn oldest(&self) -> Option<Instant> {
+        self.order.first().map(|(since, _)| *since)
+    }
+
+    /// Removes and returns the connection that has been unused longest.
+    fn pop_oldest(&mut self) -> Option<ConnId> {
+        let (_, conn_id) = self.order.pop_first()?;
+        self.since.remove(&conn_id);
+        Some(conn_id)
+    }
+
+    /// Removes and returns a connection that has been unused for `timeout`.
+    fn pop_expired(&mut self, now: Instant, timeout: Duration) -> Option<ConnId> {
+        let (since, conn_id) = *self.order.first()?;
+        if since + timeout > now {
+            return None;
+        }
+        self.order.pop_first();
+        self.since.remove(&conn_id);
+        Some(conn_id)
+    }
+
+    /// Returns the unused connections, the one unused longest first.
+    fn iter(&self) -> impl Iterator<Item = ConnId> + '_ {
+        self.order.iter().map(|(_, conn_id)| *conn_id)
+    }
+}
+
+/// The result of an attempt: a dial, or adopting an incoming connection.
+type ConnectResult = (ConnId, Result<Connection, PoolConnectError>);
 
 struct Actor {
     /// Inbox
     rx: mpsc::Receiver<ActorMessage>,
-    /// Separate inbox for unused events, gets processed before the main inbox.
+    /// Separate inbox for events, which get processed before the main inbox.
+    events_rx: mpsc::UnboundedReceiver<Event>,
+    /// Sender for the event inbox, cloned into each connection counter.
     ///
-    /// Each event names the peer and the generation of the connection.
-    unused_rx: mpsc::UnboundedReceiver<(EndpointId, u64)>,
-    /// Sender for the unused inbox to be cloned into the connection counter.
-    ///
-    /// This is unbounded so it can be used in Drop. It holds at most one event per
-    /// connection going unused, and the actor drains it before anything else.
-    unused_tx: mpsc::UnboundedSender<(EndpointId, u64)>,
+    /// This is unbounded so it can be used in Drop. It holds at most one unused
+    /// event per connection, and the actor drains it before anything else.
+    events_tx: mpsc::UnboundedSender<Event>,
     options: Options,
     endpoint: Endpoint,
     alpn: Arc<[u8]>,
-    peers: HashMap<EndpointId, PeerState>,
-    /// Futures for currently connecting peers.
+    /// What the pool holds for each peer it knows.
+    peers: HashMap<EndpointId, Peer>,
+    /// The connections the pool holds, current and superseded.
+    ///
+    /// This is what [`Options::max_connections`] limits.
+    held: usize,
+    /// The connections nothing uses, oldest first.
+    idle: IdleSet,
+    /// Futures for the attempts that are running.
     connecting: FuturesUnordered<Boxed<ConnectResult>>,
-    /// Incoming connections whose `on_connected` is running, by generation.
-    ///
-    /// The peer's current connection keeps serving requests until the incoming
-    /// one is adopted.
-    adopting: HashMap<u64, (EndpointId, RefSender)>,
-    /// Superseded connections that are still open, by peer and generation.
-    superseded: HashMap<(EndpointId, u64), Superseded>,
-    /// Generation counter used to distinguish between connection attempts to the same peer.
-    next_generation: u64,
-    /// Futures for connection close watchers.
-    ///
-    /// Each yields the peer and the generation of the connection it watches.
-    conn_close: FuturesUnordered<Boxed<(EndpointId, u64)>>,
-    /// Currently unused connections, in order of when they became unused.
-    ///
-    /// Keyed by each peer's `unused_since`, so a peer's entry can be found and
-    /// removed without a scan. The first entry is the next connection to close
-    /// for being unused.
-    unused: BTreeSet<(Instant, EndpointId)>,
-    /// Unused superseded connections, keyed like `unused` plus the generation.
-    ///
-    /// Kept apart because they do not count against `max_connections`, so
-    /// eviction does not pick them.
-    superseded_unused: BTreeSet<(Instant, EndpointId, u64)>,
+    /// Futures that wait for a connection to close, each yielding which one.
+    conn_close: FuturesUnordered<Boxed<ConnId>>,
+    /// The generation the next attempt gets.
+    next_generation: Generation,
 }
 
 impl Actor {
@@ -349,23 +635,21 @@ impl Actor {
         options: Options,
     ) -> (Self, mpsc::Sender<ActorMessage>) {
         let (tx, rx) = mpsc::channel(INBOX_CAPACITY);
-        let (unused_tx, unused_rx) = mpsc::unbounded_channel();
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
         (
             Self {
                 rx,
-                unused_rx,
-                unused_tx,
+                events_rx,
+                events_tx,
                 options,
                 endpoint,
                 alpn: alpn.to_vec().into(),
                 peers: HashMap::new(),
+                held: 0,
+                idle: IdleSet::default(),
                 connecting: FuturesUnordered::new(),
-                adopting: HashMap::new(),
-                superseded: HashMap::new(),
-                next_generation: 0,
                 conn_close: FuturesUnordered::new(),
-                unused: BTreeSet::new(),
-                superseded_unused: BTreeSet::new(),
+                next_generation: Generation(0),
             },
             tx,
         )
@@ -375,33 +659,30 @@ impl Actor {
         // We bias processing internal events before accepting more work from
         // the external mailbox.
         loop {
-            let first_unused = self.unused.first().map(|(since, _)| *since);
-            let first_superseded = self.superseded_unused.first().map(|(since, ..)| *since);
-            let next_unused_timer_at = match first_unused.into_iter().chain(first_superseded).min()
-            {
+            let next_idle_timeout = match self.idle.oldest() {
                 None => MaybeFuture::None,
-                Some(unused_since) => {
-                    let deadline = unused_since + self.options.idle_timeout;
+                Some(since) => {
+                    let deadline = since + self.options.idle_timeout;
                     MaybeFuture::Some(n0_future::time::sleep_until(deadline))
                 }
             };
             tokio::select! {
                 biased;
 
-                // Handle unused events first, since this might give us some room.
-                Some((id, generation)) = self.unused_rx.recv() => {
-                    self.handle_unused_event(id, generation);
+                // Handle events first, since this might give us some room.
+                Some(event) = self.events_rx.recv() => {
+                    self.handle_event(event);
                 }
 
-                Some((id, generation, result)) = self.connecting.next(), if !self.connecting.is_empty() => {
-                    self.handle_connect_result(id, generation, result);
+                Some((conn_id, result)) = self.connecting.next(), if !self.connecting.is_empty() => {
+                    self.handle_connect_result(conn_id, result);
                 }
 
-                Some((id, generation)) = self.conn_close.next(), if !self.conn_close.is_empty() => {
-                    self.handle_conn_closed(id, generation);
+                Some(conn_id) = self.conn_close.next(), if !self.conn_close.is_empty() => {
+                    self.handle_conn_closed(conn_id);
                 }
 
-                _ = next_unused_timer_at => self.close_unused(),
+                _ = next_idle_timeout => self.close_unused(),
 
                 msg = self.rx.recv() => {
                     let Some(msg) = msg else { break };
@@ -410,26 +691,8 @@ impl Actor {
             }
         }
 
-        // Notify waiters during shutdown and close connections.
-        for (_, state) in self.peers.drain() {
-            match state {
-                PeerState::Connecting { waiters, .. } => {
-                    for tx in waiters {
-                        let _ = tx.send(Err(e!(PoolConnectError::Shutdown)));
-                    }
-                }
-                PeerState::Ready {
-                    connection,
-                    counter,
-                    ..
-                } => close(&connection, &counter),
-            }
-        }
-        for (_, (_, tx)) in self.adopting.drain() {
-            let _ = tx.send(Err(e!(PoolConnectError::Shutdown)));
-        }
-        for (_, superseded) in self.superseded.drain() {
-            close(&superseded.connection, &superseded.counter);
+        for id in self.peers.keys().copied().collect::<Vec<_>>() {
+            self.close_peer(id, e!(PoolConnectError::Shutdown));
         }
     }
 
@@ -439,61 +702,48 @@ impl Actor {
             ActorMessage::HandleConnection { conn, tx } => self.handle_incoming(conn, tx),
             ActorMessage::ConnectionShutdown { id } => {
                 trace!(%id, "shutdown requested");
-                self.close_peer(id);
+                self.close_peer(id, e!(PoolConnectError::Closed));
             }
         }
     }
 
-    fn handle_request(&mut self, req: RequestRef) {
-        let id = req.id;
-        // A connection that closed a moment ago is still the peer's current one
-        // until its close event reaches the actor. Handing it out would give the
-        // caller a connection that fails on first use.
-        if let Some(PeerState::Ready { connection, .. }) = self.peers.get(&id)
-            && connection.close_reason().is_some()
-        {
-            debug!(%id, "current connection has closed, dialing again");
-            self.remove_peer(id);
+    fn handle_event(&mut self, event: Event) {
+        match event {
+            Event::Unused(conn_id) => self.handle_unused(conn_id),
+            Event::Connected(conn_id, connection) => self.handle_connected(conn_id, connection),
         }
-        if let Some(state) = self.peers.get_mut(&id) {
-            match state {
-                PeerState::Connecting { waiters, .. } => {
-                    waiters.push(req.tx);
-                    return;
-                }
-                PeerState::Ready {
-                    connection,
-                    counter,
-                    unused_since,
-                    ..
-                } => {
-                    if let Some(since) = unused_since.take() {
-                        self.unused.remove(&(since, id));
-                    }
-                    let one = counter.get_one();
-                    debug!(%id, count = counter.current(), "Handing out ConnectionRef");
-                    let _ = req.tx.send(Ok(ConnectionRef::new(connection.clone(), one)));
-                    return;
-                }
-            }
-        }
+    }
 
-        if !self.make_room() {
-            let _ = req.tx.send(Err(e!(PoolConnectError::TooManyConnections)));
+    /// Hands out a reference to the peer's connection, making one if needed.
+    fn handle_request(&mut self, req: RequestRef) {
+        let RequestRef { id, tx } = req;
+        // The pool learns that a connection closed through a watcher future, so
+        // a closed connection can still be the peer's current one. Handing it
+        // out would give the caller a connection that fails on first use.
+        if let Some(conn) = self.ready(id).cloned()
+            && conn.connection.close_reason().is_some()
+        {
+            debug!(conn_id = %conn.conn_id(), "current connection has closed, connecting again");
+            self.remove_connection(conn.conn_id());
+        }
+        if let Some(conn) = self.ready(id).cloned() {
+            self.idle.remove(conn.conn_id());
+            debug!(%id, count = conn.counter.current(), "handing out a ConnectionRef");
+            let _ = tx.send(Ok(conn.conn_ref()));
             return;
         }
-
-        let generation = self.next_generation;
-        self.next_generation += 1;
-        self.peers.insert(
-            id,
-            PeerState::Connecting {
-                generation,
-                waiters: vec![req.tx],
-            },
-        );
-        self.connecting
-            .push(self.make_connect_future(id, generation, None));
+        // An attempt is running. An adoption counts: once it is adopted, its
+        // connection is the one requests get, so dialing as well would make a
+        // connection that the adoption supersedes right away.
+        if let Some(attempt) = self.peers.get_mut(&id).and_then(Peer::pending_mut) {
+            attempt.waiters.push(tx);
+            return;
+        }
+        if !self.can_make_room() {
+            let _ = tx.send(Err(e!(PoolConnectError::TooManyConnections)));
+            return;
+        }
+        self.start_attempt(id, None, tx);
     }
 
     /// Starts adopting a connection the peer opened.
@@ -503,447 +753,409 @@ impl Actor {
     /// [`ConnectionPool::handle_connection`].
     fn handle_incoming(&mut self, conn: Connection, tx: RefSender) {
         let id = conn.remote_id();
-        let current = matches!(
-            self.peers.get(&id),
-            Some(PeerState::Ready { connection, .. }) if connection.stable_id() == conn.stable_id()
-        );
-        if current {
-            return self.handle_request(RequestRef { id, tx });
+        // The pool may hold this connection already, as the peer's current
+        // connection or as one it superseded, or be adopting it. Adopting it
+        // again would give one connection two generations and two reference
+        // counts, and closing either would close the connection the other one
+        // still hands out.
+        if let Some(held) = self
+            .peers
+            .get(&id)
+            .and_then(|peer| peer.held_connection(&conn))
+            .cloned()
+        {
+            self.idle.remove(held.conn_id());
+            let _ = tx.send(Ok(held.conn_ref()));
+            return;
         }
-        if !self.peers.contains_key(&id) && !self.make_room() {
+        if let Some(attempt) = self
+            .peers
+            .get_mut(&id)
+            .and_then(|peer| peer.adoption_mut(&conn))
+        {
+            attempt.waiters.push(tx);
+            return;
+        }
+        if !self.can_make_room() {
             let _ = tx.send(Err(e!(PoolConnectError::TooManyConnections)));
             return;
         }
-        let generation = self.next_generation;
-        self.next_generation += 1;
-        self.adopting.insert(generation, (id, tx));
-        self.connecting
-            .push(self.make_connect_future(id, generation, Some(conn)));
+        self.start_attempt(id, Some(conn), tx);
     }
 
-    /// Makes room for one more connection if the pool holds `max_connections`.
+    /// Starts a dial, or the adoption of `incoming`.
+    fn start_attempt(&mut self, id: EndpointId, incoming: Option<Connection>, tx: RefSender) {
+        let conn_id = ConnId {
+            peer: id,
+            generation: self.next_generation.next(),
+        };
+        let counter = ConnectionCounter::new(conn_id, self.events_tx.clone());
+        let attempt = Attempt {
+            generation: conn_id.generation,
+            counter: counter.clone(),
+            connection: incoming.clone(),
+            waiters: vec![tx],
+        };
+        let peer = self.peers.entry(id).or_default();
+        if incoming.is_some() {
+            peer.adopting.push(attempt);
+        } else {
+            debug_assert!(peer.current.is_none(), "a peer got a second dial");
+            peer.current = Some(Current::Connecting(attempt));
+        }
+        self.connecting
+            .push(self.make_connect_future(conn_id, counter, incoming));
+    }
+
+    /// Returns the peer's current connection.
+    fn ready(&self, id: EndpointId) -> Option<&PooledConnection> {
+        self.peers.get(&id).and_then(Peer::ready)
+    }
+
+    /// Returns the connection with `conn_id`, current or superseded.
+    fn connection(&self, conn_id: ConnId) -> Option<&PooledConnection> {
+        self.peers
+            .get(&conn_id.peer)
+            .and_then(|peer| peer.connection(conn_id))
+    }
+
+    /// Returns whether the pool has room for one more connection.
     ///
-    /// Evicts the connection that has been unused the longest, and returns
-    /// `false` if there is none.
-    fn make_room(&mut self) -> bool {
-        let connections = self
-            .peers
-            .values()
-            .filter(|state| matches!(state, PeerState::Ready { .. }))
-            .count();
-        if connections < self.options.max_connections {
+    /// Unlike [`Self::make_room`], this does not evict anything: an attempt
+    /// that may still fail should not close a connection that works. The
+    /// attempt evicts when it has a connection to put in its place.
+    fn can_make_room(&self) -> bool {
+        if self.held < self.options.max_connections {
             return true;
         }
-        while let Some((since, id)) = self.unused.pop_first() {
-            let Some(PeerState::Ready {
-                counter,
-                unused_since,
-                ..
-            }) = self.peers.get_mut(&id)
-            else {
-                debug_assert!(false, "the unused list names a peer that is not ready");
+        // A connection on the idle list may be in use again, through an upgrade
+        // that did not go through the pool, so only an unused one is room.
+        self.idle.iter().any(|conn_id| {
+            self.connection(conn_id)
+                .is_some_and(PooledConnection::is_unused)
+        })
+    }
+
+    /// Makes room for one more connection if the pool is full.
+    ///
+    /// Evicts the connections that have been unused the longest, and returns
+    /// `false` if there is nothing to evict.
+    fn make_room(&mut self) -> bool {
+        while self.held >= self.options.max_connections {
+            let Some(conn_id) = self.idle.pop_oldest() else {
+                return false;
+            };
+            let Some(conn) = self.connection(conn_id).cloned() else {
                 continue;
             };
-            debug_assert_eq!(*unused_since, Some(since));
-            // Upgrading a `WeakConnectionRef` does not go through the pool, so a
-            // peer on the list may be in use again. Its next drop to zero lists
-            // it again.
-            if !counter.try_close_unused() {
-                *unused_since = None;
+            // A connection on the idle list may be in use again, through an
+            // upgrade that did not go through the pool. Its next drop to zero
+            // lists it again.
+            if !conn.close_if_unused() {
                 continue;
             }
-            trace!("evicting oldest unused peer {id} to make room");
-            self.remove_peer(id);
-            return true;
+            debug!(%conn_id, "evicting the connection unused longest to make room");
+            self.remove_connection(conn_id);
         }
-        false
+        true
     }
 
-    /// Returns a future that dials `id` or adopts `incoming`.
+    /// Returns a future that dials the peer or adopts `incoming`.
     ///
     /// The future runs `on_connected` as well, all within the connect timeout.
     fn make_connect_future(
         &self,
-        id: EndpointId,
-        generation: u64,
+        conn_id: ConnId,
+        counter: ConnectionCounter,
         incoming: Option<Connection>,
     ) -> Boxed<ConnectResult> {
         let endpoint = self.endpoint.clone();
         let alpn = self.alpn.clone();
         let on_connected = self.options.on_connected.clone();
         let connect_timeout = self.options.connect_timeout;
-        let unused_tx = self.unused_tx.clone();
+        let events_tx = self.events_tx.clone();
         Box::pin(async move {
             let mut connected = None;
             let attempt = async {
-                let conn = match incoming {
-                    Some(conn) => conn,
-                    None => endpoint
-                        .connect(id, &alpn[..])
-                        .await
-                        .map_err(PoolConnectError::from)?,
+                let connection = match incoming {
+                    Some(connection) => connection,
+                    None => {
+                        let connection = endpoint
+                            .connect(conn_id.peer, &alpn[..])
+                            .await
+                            .map_err(PoolConnectError::from)?;
+                        // Hand the connection to the pool before `on_connected`
+                        // runs, so that it can close it in the meantime.
+                        let _ = events_tx.send(Event::Connected(conn_id, connection.clone()));
+                        connection
+                    }
                 };
-                let counter = ConnectionCounter::new(id, generation, unused_tx);
-                connected = Some((conn.clone(), counter.clone()));
+                connected = Some(connection.clone());
                 if let Some(f) = &on_connected {
-                    // The reference is dropped when the callback returns, so
-                    // the connection is unused again unless the callback kept
-                    // one. Its drop sends an unused event for a connection the
-                    // pool does not hold yet, which the actor ignores;
-                    // `insert_ready` lists the connection as unused itself.
-                    let conn_ref = ConnectionRef::new(conn.clone(), counter.get_one());
+                    let conn_ref = ConnectionRef::new(connection.clone(), counter.get_one());
                     f(&endpoint, &conn_ref)
                         .await
                         .map_err(PoolConnectError::from)?;
                 }
-                Result::<_, PoolConnectError>::Ok((conn, counter))
+                Result::<_, PoolConnectError>::Ok(connection)
             };
             let result = match n0_future::time::timeout(connect_timeout, attempt).await {
-                Ok(r) => r,
+                Ok(result) => result,
                 Err(_) => Err(e!(PoolConnectError::Timeout)),
             };
             // `on_connected` failed or ran out of time. Close the connection
             // rather than drop it: the callback may have handed it to a task.
             if result.is_err()
-                && let Some((conn, counter)) = connected
+                && let Some(connection) = connected
             {
-                close_as(&conn, &counter, b"on_connected failed");
+                counter.mark_closed();
+                connection.close(0u32.into(), b"on_connected failed");
             }
-            (id, generation, result)
+            (conn_id, result)
         })
     }
 
-    fn handle_connect_result(
-        &mut self,
-        id: EndpointId,
-        generation: u64,
-        result: Result<(Connection, ConnectionCounter), PoolConnectError>,
-    ) {
-        if let Some((_, tx)) = self.adopting.remove(&generation) {
-            return self.handle_adopt_result(id, generation, result, tx);
-        }
-        let current = matches!(
-            self.peers.get(&id),
-            Some(PeerState::Connecting { generation: g, .. }) if *g == generation
-        );
-        if !current {
-            // PeerState was removed or changed in the meantime, discard the connection.
-            debug!(%id, "stale connect result, discarding");
-            if let Ok((conn, counter)) = result {
-                close_as(&conn, &counter, b"discarded");
-            }
+    /// Remembers the connection an attempt has made.
+    ///
+    /// `on_connected` is usually still running for it, so the pool cannot hand
+    /// the connection out yet, but it can close it, and does when the peer is
+    /// closed meanwhile.
+    fn handle_connected(&mut self, conn_id: ConnId, connection: Connection) {
+        if let Some(attempt) = self
+            .peers
+            .get_mut(&conn_id.peer)
+            .and_then(|peer| peer.attempt_mut(conn_id.generation))
+        {
+            attempt.connection = Some(connection);
             return;
         }
-        let Some(PeerState::Connecting { waiters, .. }) = self.peers.remove(&id) else {
+        // The attempt has finished. An attempt sends this event and then
+        // finishes, and the actor can see both at once, so the pool may be
+        // holding the connection by now.
+        if self.connection(conn_id).is_some() {
             return;
-        };
-        match result {
-            // Connections made since this attempt started may have filled the pool.
-            Ok((conn, counter)) if !self.make_room() => {
-                debug!(%id, "connected, but the pool is full");
-                close_as(&conn, &counter, b"too many connections");
-                for tx in waiters {
-                    let _ = tx.send(Err(e!(PoolConnectError::TooManyConnections)));
-                }
-            }
-            Ok((conn, counter)) => self.insert_ready(id, generation, conn, counter, waiters),
-            Err(cause) => {
-                debug!(%id, "connect failed: {cause:?}");
-                for tx in waiters {
-                    let _ = tx.send(Err(cause.clone()));
-                }
-            }
         }
+        // The peer was closed while the attempt ran, so nothing will hand this
+        // connection out. Its result is discarded when it arrives.
+        debug!(%conn_id, "the peer was closed while connecting");
+        connection.close(0u32.into(), b"closed");
     }
 
-    /// Makes an adopted incoming connection the peer's current one.
-    ///
-    /// A current connection is superseded rather than closed: two endpoints
-    /// that dial each other at once each keep the connection they saw last, and
-    /// may disagree, so the peer can still be using it. A dial that is still
-    /// running is superseded too. Its waiters get the incoming connection, and
-    /// its result is discarded when it arrives.
-    fn handle_adopt_result(
+    /// Makes the connection an attempt produced the peer's current one.
+    fn handle_connect_result(
         &mut self,
-        id: EndpointId,
-        generation: u64,
-        result: Result<(Connection, ConnectionCounter), PoolConnectError>,
-        tx: RefSender,
+        conn_id: ConnId,
+        result: Result<Connection, PoolConnectError>,
     ) {
-        let (conn, counter) = match result {
-            Ok(adopted) => adopted,
+        let Some(attempt) = self
+            .peers
+            .get_mut(&conn_id.peer)
+            .and_then(|peer| peer.remove_attempt(conn_id.generation))
+        else {
+            // The peer was closed while the attempt ran.
+            debug!(%conn_id, "stale connect result, discarding");
+            if let Ok(connection) = result {
+                connection.close(0u32.into(), b"discarded");
+            }
+            return;
+        };
+        let connection = match result {
+            Ok(connection) => connection,
             Err(cause) => {
-                debug!(%id, "adopting incoming connection failed: {cause:?}");
-                let _ = tx.send(Err(cause));
+                debug!(%conn_id, "attempt failed: {cause:?}");
+                attempt.fail(cause);
+                self.drop_peer_if_empty(conn_id.peer);
                 return;
             }
         };
-        // Connections made since the adoption started may have filled the pool.
-        if !self.peers.contains_key(&id) && !self.make_room() {
-            debug!(%id, "adopted, but the pool is full");
-            close_as(&conn, &counter, b"too many connections");
-            let _ = tx.send(Err(e!(PoolConnectError::TooManyConnections)));
+        let conn = PooledConnection::new(connection, attempt.counter.clone());
+        // Connections made while the attempt ran may have filled the pool. A
+        // connection this one supersedes stays open, so every attempt that
+        // finishes adds one to the connections the pool holds.
+        if !self.make_room() {
+            debug!(%conn_id, "connected, but the pool is full");
+            conn.close_as(b"too many connections");
+            attempt.fail(e!(PoolConnectError::TooManyConnections));
+            self.drop_peer_if_empty(conn_id.peer);
             return;
         }
-        let mut waiters = match self.peers.remove(&id) {
-            Some(PeerState::Ready {
-                generation: old,
-                connection,
-                counter,
-                unused_since,
-            }) => {
-                debug!(%id, "incoming connection supersedes the current one");
-                if let Some(since) = unused_since {
-                    self.unused.remove(&(since, id));
-                }
-                let superseded = Superseded {
-                    connection,
-                    counter,
-                    unused_since,
-                };
-                self.supersede(id, old, superseded);
-                Vec::new()
-            }
-            Some(PeerState::Connecting { waiters, .. }) => waiters,
-            None => Vec::new(),
-        };
-        waiters.push(tx);
-        self.insert_ready(id, generation, conn, counter, waiters);
+        self.insert_current(conn, attempt.waiters);
     }
 
     /// Makes `conn` the peer's current connection and hands it to `waiters`.
-    fn insert_ready(
-        &mut self,
-        id: EndpointId,
-        generation: u64,
-        conn: Connection,
-        counter: ConnectionCounter,
-        waiters: Vec<RefSender>,
-    ) {
+    fn insert_current(&mut self, conn: PooledConnection, mut waiters: Vec<RefSender>) {
+        let conn_id = conn.conn_id();
+        let peer = self.peers.entry(conn_id.peer).or_default();
+        match peer.current.take() {
+            Some(Current::Ready(previous)) => {
+                // Two endpoints that dial each other at once each keep the
+                // connection they saw last, and may disagree, so the peer can
+                // still be using this one. It closes when it is unused, like
+                // any other connection the pool holds.
+                debug!(%conn_id, "the new connection supersedes the current one");
+                previous.counter.mark_superseded();
+                peer.superseded.push(previous);
+            }
+            Some(Current::Connecting(dial)) => {
+                // A dial that is still running loses to this connection. Its
+                // waiters get this one, and its own connection, if it has made
+                // one, is closed. Its result is discarded when it arrives.
+                debug!(%conn_id, "the new connection serves a running dial");
+                dial.close_as(b"discarded");
+                waiters.extend(dial.waiters);
+            }
+            None => {}
+        }
+        peer.current = Some(Current::Ready(conn.clone()));
+        self.held += 1;
         for tx in waiters {
+            // A caller that is gone takes no reference: it would put the
+            // connection in use and send an unused event when it drops.
             if tx.is_closed() {
                 continue;
             }
-            let permit = counter.get_one();
-            if tx
-                .send(Ok(ConnectionRef::new(conn.clone(), permit)))
-                .is_err()
-            {
-                // User is no longer interested in the ConnectionRef.
-            }
+            let _ = tx.send(Ok(conn.conn_ref()));
         }
-        info!(%id, "connected, {} ref(s) outstanding", counter.current());
+        debug!(%conn_id, refs = conn.counter.current(), "connected");
 
         // Create a future that waits for the connection to close.
-        let close_fut: Boxed<(EndpointId, u64)> = {
-            let conn = conn.clone();
-            Box::pin(async move {
-                conn.closed().await;
-                (id, generation)
-            })
-        };
-        self.conn_close.push(close_fut);
-
-        let unused_since = counter.is_unused().then(Instant::now);
-        if let Some(since) = unused_since {
-            self.unused.insert((since, id));
+        self.conn_close.push(Box::pin({
+            let connection = conn.connection.clone();
+            async move {
+                connection.closed().await;
+                conn_id
+            }
+        }));
+        if conn.is_unused() {
+            self.idle.insert(conn_id, Instant::now());
         }
-        self.peers.insert(
-            id,
-            PeerState::Ready {
-                generation,
-                connection: conn,
-                counter,
-                unused_since,
-            },
-        );
+        self.close_oldest_superseded(conn_id.peer);
     }
 
-    /// Keeps a superseded connection open until it is unused.
+    /// Closes the peer's superseded connections beyond the cap.
     ///
-    /// It keeps the idle state it had as the current connection.
-    fn supersede(&mut self, id: EndpointId, generation: u64, superseded: Superseded) {
-        superseded
-            .counter
-            .inner
-            .superseded
-            .store(true, Ordering::SeqCst);
-        if let Some(since) = superseded.unused_since {
-            self.superseded_unused.insert((since, id, generation));
+    /// A peer that opens connections in a loop would otherwise make the pool
+    /// hold one per attempt, each until it goes unused. The oldest are closed,
+    /// in use or not, as [`ConnectionPool::close`] closes them.
+    fn close_oldest_superseded(&mut self, id: EndpointId) {
+        loop {
+            let Some(peer) = self.peers.get_mut(&id) else {
+                return;
+            };
+            if peer.superseded.len() <= self.options.max_superseded_per_peer {
+                return;
+            }
+            let conn = peer.superseded.remove(0);
+            debug!(conn_id = %conn.conn_id(), "too many superseded connections, closing the oldest");
+            self.release(&conn);
         }
-        self.superseded.insert((id, generation), superseded);
-    }
-
-    /// Stops tracking a superseded connection, and returns it.
-    fn remove_superseded(&mut self, id: EndpointId, generation: u64) -> Option<Superseded> {
-        let superseded = self.superseded.remove(&(id, generation))?;
-        if let Some(since) = superseded.unused_since {
-            self.superseded_unused.remove(&(since, id, generation));
-        }
-        Some(superseded)
     }
 
     /// Handles a connection closing, by us or by the peer.
     ///
-    /// Only acts if the connection is still the peer's current one. One the
+    /// An event for a connection the pool no longer holds is ignored: one the
     /// pool replaced has closed already, and must not take down its successor.
-    fn handle_conn_closed(&mut self, id: EndpointId, generation: u64) {
-        let current = matches!(
-            self.peers.get(&id),
-            Some(PeerState::Ready { generation: g, .. }) if *g == generation
-        );
-        if current {
-            trace!(%id, "connection closed");
-            self.remove_peer(id);
-        } else if self.remove_superseded(id, generation).is_some() {
-            trace!(%id, "superseded connection closed");
+    fn handle_conn_closed(&mut self, conn_id: ConnId) {
+        if self.remove_connection(conn_id).is_some() {
+            trace!(%conn_id, "connection closed");
         }
     }
 
     /// Handles a connection going unused.
     ///
-    /// Only acts on the connection the event names: the peer's current one, or
-    /// one it superseded. References to a connection the pool has let go of can
-    /// outlive it, and their last drop must not restart another connection's
-    /// idle timeout.
-    fn handle_unused_event(&mut self, id: EndpointId, generation: u64) {
-        if let Some(superseded) = self.superseded.get_mut(&(id, generation)) {
-            if !superseded.counter.is_unused() {
-                return;
-            }
-            let now = Instant::now();
-            if let Some(since) = superseded.unused_since.replace(now) {
-                self.superseded_unused.remove(&(since, id, generation));
-            }
-            self.superseded_unused.insert((now, id, generation));
-            return;
-        }
-        let Some(PeerState::Ready {
-            generation: g,
-            counter,
-            unused_since,
-            ..
-        }) = self.peers.get_mut(&id)
-        else {
+    /// An event for a connection the pool no longer holds is ignored:
+    /// references to it can outlive it, and their last drop must not restart
+    /// another connection's idle timeout.
+    fn handle_unused(&mut self, conn_id: ConnId) {
+        let Some(conn) = self.connection(conn_id) else {
             return;
         };
-        if *g != generation {
+        // The connection was handed out again in the meantime.
+        if !conn.is_unused() {
             return;
         }
-        // Connection was handed out in the meantime.
-        if !counter.is_unused() {
-            return;
-        }
-        let now = Instant::now();
-        if let Some(since) = unused_since.replace(now) {
-            self.unused.remove(&(since, id));
-        }
-        self.unused.insert((now, id));
-        trace!(%id, "peer unused");
+        self.idle.insert(conn_id, Instant::now());
+        trace!(%conn_id, "connection unused");
     }
 
     /// Closes the connections that have been unused for the idle timeout.
-    ///
-    /// Upgrading a `WeakConnectionRef` does not go through the pool, so a listed
-    /// connection may be in use again. It is taken off the list, and its next
-    /// drop to zero lists it again. The pool and an upgrade race for the
-    /// connection through its counter, so exactly one of them wins.
     fn close_unused(&mut self) {
         let now = Instant::now();
         let timeout = self.options.idle_timeout;
-        while let Some(&(since, id)) = self.unused.first()
-            && since + timeout <= now
-        {
-            self.unused.pop_first();
-            let Some(PeerState::Ready {
-                counter,
-                unused_since,
-                ..
-            }) = self.peers.get_mut(&id)
-            else {
+        while let Some(conn_id) = self.idle.pop_expired(now, timeout) {
+            let Some(conn) = self.connection(conn_id).cloned() else {
                 continue;
             };
-            if counter.try_close_unused() {
-                trace!(%id, "unused timeout, removing");
-                self.remove_peer(id);
-            } else {
-                *unused_since = None;
-            }
-        }
-        while let Some(&(since, id, generation)) = self.superseded_unused.first()
-            && since + timeout <= now
-        {
-            self.superseded_unused.pop_first();
-            let Some(superseded) = self.superseded.get_mut(&(id, generation)) else {
+            // A connection on the idle list may be in use again, through an
+            // upgrade that did not go through the pool. Its next drop to zero
+            // lists it again.
+            if !conn.close_if_unused() {
                 continue;
-            };
-            if superseded.counter.try_close_unused() {
-                debug!(%id, "closing unused superseded connection");
-                close(&superseded.connection, &superseded.counter);
-                self.superseded.remove(&(id, generation));
-            } else {
-                superseded.unused_since = None;
             }
+            trace!(%conn_id, "unused timeout, closing");
+            self.remove_connection(conn_id);
         }
     }
 
     /// Closes every connection to `id`, and fails the attempts to get one.
     ///
-    /// See [`ConnectionPool::close`].
-    fn close_peer(&mut self, id: EndpointId) {
-        self.remove_peer(id);
-        // Their results are discarded as stale when they arrive.
-        for (_, (_, tx)) in self.adopting.extract_if(|_, (peer, _)| *peer == id) {
-            let _ = tx.send(Err(e!(PoolConnectError::Closed)));
-        }
-        for (_, superseded) in self.superseded.extract_if(|(peer, _), _| *peer == id) {
-            close(&superseded.connection, &superseded.counter);
-        }
-        self.superseded_unused.retain(|(_, peer, _)| *peer != id);
-    }
-
-    fn remove_peer(&mut self, id: EndpointId) {
-        if let Some(state) = self.peers.remove(&id) {
-            match state {
-                PeerState::Connecting { waiters, .. } => {
-                    for tx in waiters {
-                        let _ = tx.send(Err(e!(PoolConnectError::Closed)));
-                    }
-                }
-                PeerState::Ready {
-                    connection,
-                    counter,
-                    unused_since,
-                    ..
-                } => {
-                    close(&connection, &counter);
-                    if let Some(since) = unused_since {
-                        self.unused.remove(&(since, id));
-                    }
-                }
+    /// Waiters get `cause`, which says whether the pool is shutting down or the
+    /// peer was closed. See [`ConnectionPool::close`].
+    fn close_peer(&mut self, id: EndpointId, cause: PoolConnectError) {
+        let Some(peer) = self.peers.remove(&id) else {
+            return;
+        };
+        let Peer {
+            current,
+            adopting,
+            superseded,
+        } = peer;
+        let attempts = match current {
+            Some(Current::Ready(conn)) => {
+                self.release(&conn);
+                None
             }
+            Some(Current::Connecting(attempt)) => Some(attempt),
+            None => None,
+        };
+        for conn in &superseded {
+            self.release(conn);
+        }
+        for attempt in attempts.into_iter().chain(adopting) {
+            // The connection an attempt has made is closed here. The attempt
+            // runs to its end, and its result is discarded when it arrives.
+            attempt.close_as(b"closed");
+            attempt.fail(cause.clone());
+        }
+    }
+
+    /// Stops holding the connection, and closes it.
+    fn release(&mut self, conn: &PooledConnection) {
+        self.idle.remove(conn.conn_id());
+        self.held -= 1;
+        conn.close();
+    }
+
+    /// Stops holding the connection, and returns it.
+    ///
+    /// The caller closes it if it is still open: a connection the pool evicts
+    /// is closed differently from one the peer closed.
+    fn remove_connection(&mut self, conn_id: ConnId) -> Option<PooledConnection> {
+        let peer = self.peers.get_mut(&conn_id.peer)?;
+        let conn = peer.remove_connection(conn_id)?;
+        self.held -= 1;
+        self.idle.remove(conn_id);
+        self.drop_peer_if_empty(conn_id.peer);
+        Some(conn)
+    }
+
+    /// Forgets the peer if the pool holds nothing for it.
+    fn drop_peer_if_empty(&mut self, id: EndpointId) {
+        if self.peers.get(&id).is_some_and(Peer::is_empty) {
+            self.peers.remove(&id);
         }
     }
 }
-
-/// Closes `connection`, with a reason that says whether it was in use.
-///
-/// The reason is `unused` if nothing uses it, and `drop` otherwise.
-fn close(connection: &Connection, counter: &ConnectionCounter) {
-    let reason: &[u8] = if counter.is_unused() {
-        b"unused"
-    } else {
-        b"drop"
-    };
-    close_as(connection, counter, reason);
-}
-
-/// Closes `connection` with `reason`, and fails later upgrades to it.
-fn close_as(connection: &Connection, counter: &ConnectionCounter, reason: &[u8]) {
-    counter.mark_closed();
-    connection.close(0u32.into(), reason);
-}
-
 /// A connection pool
 ///
 /// Dropping the last handle stops the pool and closes its connections, including
@@ -1030,16 +1242,19 @@ impl ConnectionPool {
 ///
 /// It lives in the same atomic as the count, so closing an unused connection and
 /// taking a reference to it cannot both succeed.
+/// The bit of [`ConnectionCounterInner::count`] that marks the connection closed.
+///
+/// It lives in the same atomic as the count, so closing an unused connection and
+/// taking a reference to it cannot both succeed.
 const CLOSED: usize = 1 << (usize::BITS - 1);
 
 #[derive(Debug)]
 struct ConnectionCounterInner {
     /// The number of references, with [`CLOSED`] set once the pool closed it.
     count: AtomicUsize,
-    id: EndpointId,
-    /// The generation of the connection, which unused events name.
-    generation: u64,
-    unused_tx: mpsc::UnboundedSender<(EndpointId, u64)>,
+    /// Which connection this counts, which the events it sends name.
+    conn_id: ConnId,
+    events_tx: mpsc::UnboundedSender<Event>,
     /// Set once a newer connection to the same endpoint took this one's place.
     superseded: AtomicBool,
 }
@@ -1050,20 +1265,20 @@ struct ConnectionCounter {
 }
 
 impl ConnectionCounter {
-    fn new(
-        id: EndpointId,
-        generation: u64,
-        unused_tx: mpsc::UnboundedSender<(EndpointId, u64)>,
-    ) -> Self {
+    fn new(conn_id: ConnId, events_tx: mpsc::UnboundedSender<Event>) -> Self {
         Self {
             inner: Arc::new(ConnectionCounterInner {
                 count: AtomicUsize::new(0),
-                id,
-                generation,
-                unused_tx,
+                conn_id,
+                events_tx,
                 superseded: AtomicBool::new(false),
             }),
         }
+    }
+
+    /// Returns which connection this counts.
+    fn conn_id(&self) -> ConnId {
+        self.inner.conn_id
     }
 
     fn current(&self) -> usize {
@@ -1110,12 +1325,29 @@ impl ConnectionCounter {
     fn mark_closed(&self) {
         self.inner.count.fetch_or(CLOSED, Ordering::SeqCst);
     }
+
+    /// Marks that a newer connection to the peer took this one's place.
+    fn mark_superseded(&self) {
+        self.inner.superseded.store(true, Ordering::SeqCst);
+    }
+
+    /// Returns whether a newer connection to the peer took this one's place.
+    fn is_superseded(&self) -> bool {
+        self.inner.superseded.load(Ordering::SeqCst)
+    }
 }
 
 /// Handle to a connection counter that decrements it on drop.
 #[derive(Debug)]
 struct OneConnection {
     inner: Arc<ConnectionCounterInner>,
+}
+
+impl OneConnection {
+    /// Returns whether a newer connection to the peer took this one's place.
+    fn is_superseded(&self) -> bool {
+        self.inner.superseded.load(Ordering::SeqCst)
+    }
 }
 
 impl Clone for OneConnection {
@@ -1133,15 +1365,11 @@ impl Drop for OneConnection {
     fn drop(&mut self) {
         // A closed connection never counts as going unused: `CLOSED` is set.
         if self.inner.count.fetch_sub(1, Ordering::SeqCst) == 1 {
-            // Send an unused event to the actor.
-            let _ = self
-                .inner
-                .unused_tx
-                .send((self.inner.id, self.inner.generation));
+            // Tell the actor that the connection is unused.
+            let _ = self.inner.events_tx.send(Event::Unused(self.inner.conn_id));
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1166,8 +1394,8 @@ mod tests {
     use tracing::trace;
 
     use super::{
-        Actor, ConnectionCounter, ConnectionPool, ConnectionRef, OnConnected, Options, PeerState,
-        PoolConnectError, RequestRef,
+        Actor, ConnId, ConnectionCounter, ConnectionPool, ConnectionRef, Current, Event,
+        Generation, OnConnected, Options, PoolConnectError, PooledConnection, RequestRef,
     };
 
     const ECHO_ALPN: &[u8] = b"echo";
@@ -1249,7 +1477,29 @@ mod tests {
             idle_timeout: Duration::from_millis(100),
             connect_timeout: Duration::from_secs(5),
             max_connections: 32,
-            on_connected: None,
+            ..Default::default()
+        }
+    }
+
+    /// Puts `conn` into `actor` as its peer's current connection.
+    ///
+    /// Returns which connection it is, for the events a test hands the actor.
+    fn insert_ready(actor: &mut Actor, conn: &Connection) -> ConnId {
+        let conn_id = ConnId {
+            peer: conn.remote_id(),
+            generation: Generation(1),
+        };
+        let counter = ConnectionCounter::new(conn_id, actor.events_tx.clone());
+        let pooled = PooledConnection::new(conn.clone(), counter);
+        actor.insert_current(pooled, Vec::new());
+        conn_id
+    }
+
+    /// Returns the id of a connection to `peer` that the pool never made.
+    fn stale_conn_id(peer: EndpointId) -> ConnId {
+        ConnId {
+            peer,
+            generation: Generation(0),
         }
     }
 
@@ -1852,18 +2102,9 @@ mod tests {
             .await?;
         let conn = endpoint.connect(id, ECHO_ALPN).await?;
         let (mut actor, _tx) = Actor::new(endpoint.clone(), ECHO_ALPN, test_options());
-        let counter = ConnectionCounter::new(id, 1, actor.unused_tx.clone());
-        actor.peers.insert(
-            id,
-            PeerState::Ready {
-                generation: 1,
-                connection: conn.clone(),
-                counter,
-                unused_since: None,
-            },
-        );
+        let conn_id = insert_ready(&mut actor, &conn);
 
-        actor.handle_conn_closed(id, 0);
+        actor.handle_conn_closed(stale_conn_id(id));
         assert!(
             actor.peers.contains_key(&id),
             "a stale close event removed the peer"
@@ -1872,8 +2113,9 @@ mod tests {
             conn.close_reason().is_none(),
             "a stale close event closed the connection"
         );
-        actor.handle_conn_closed(id, 1);
+        actor.handle_conn_closed(conn_id);
         assert!(!actor.peers.contains_key(&id));
+        assert_eq!(actor.held, 0);
 
         shutdown_routers(routers).await;
         endpoint.close().await;
@@ -1896,16 +2138,7 @@ mod tests {
             .await?;
         let conn = endpoint.connect(id, ECHO_ALPN).await?;
         let (mut actor, _tx) = Actor::new(endpoint.clone(), ECHO_ALPN, test_options());
-        let counter = ConnectionCounter::new(id, 1, actor.unused_tx.clone());
-        actor.peers.insert(
-            id,
-            PeerState::Ready {
-                generation: 1,
-                connection: conn.clone(),
-                counter,
-                unused_since: None,
-            },
-        );
+        insert_ready(&mut actor, &conn);
         // The pool has not handled the close event yet.
         conn.close(0u32.into(), b"gone");
         conn.closed().await;
@@ -1917,7 +2150,10 @@ mod tests {
             "the closed connection was handed out"
         );
         assert!(
-            matches!(actor.peers.get(&id), Some(PeerState::Connecting { .. })),
+            matches!(
+                actor.peers.get(&id).and_then(|peer| peer.current.as_ref()),
+                Some(Current::Connecting(_))
+            ),
             "the request did not start a new connection"
         );
 
@@ -2037,28 +2273,20 @@ mod tests {
             .await?;
         let conn = endpoint.connect(id, ECHO_ALPN).await?;
         let (mut actor, _tx) = Actor::new(endpoint.clone(), ECHO_ALPN, test_options());
-        let counter = ConnectionCounter::new(id, 1, actor.unused_tx.clone());
-        let since = n0_future::time::Instant::now();
-        actor.unused.insert((since, id));
-        actor.peers.insert(
-            id,
-            PeerState::Ready {
-                generation: 1,
-                connection: conn,
-                counter,
-                unused_since: Some(since),
-            },
-        );
+        let conn_id = insert_ready(&mut actor, &conn);
+        let since = actor.idle.oldest().expect("the connection is unused");
 
-        actor.handle_unused_event(id, 0);
-        assert!(
-            matches!(
-                actor.peers.get(&id),
-                Some(PeerState::Ready { unused_since: Some(s), .. }) if *s == since
-            ),
+        actor.handle_unused(stale_conn_id(id));
+        assert_eq!(
+            actor.idle.oldest(),
+            Some(since),
             "a stale unused event restarted the idle timeout"
         );
-        assert_eq!(actor.unused.first(), Some(&(since, id)));
+        actor.handle_unused(conn_id);
+        assert!(
+            actor.idle.oldest().expect("still unused") >= since,
+            "the connection's own event was ignored"
+        );
 
         shutdown_routers(routers).await;
         endpoint.close().await;
@@ -2482,7 +2710,7 @@ mod tests {
         let id = SecretKey::from_bytes(&[4u8; 32]).public();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let counter = ConnectionCounter::new(id, 0, tx.clone());
+        let counter = ConnectionCounter::new(stale_conn_id(id), tx.clone());
         let permit = counter.try_get_one().expect("open connection");
         assert!(!counter.try_close_unused(), "closed a connection in use");
         drop(permit);
@@ -2492,11 +2720,45 @@ mod tests {
             "upgraded a closed connection"
         );
 
-        let counter = ConnectionCounter::new(id, 1, tx);
+        let counter = ConnectionCounter::new(stale_conn_id(id), tx);
         counter.mark_closed();
         assert!(
             counter.try_get_one().is_none(),
             "upgraded a closed connection"
+        );
+    }
+
+    /// The last reference to drop reports which connection went unused.
+    ///
+    /// Every stale event the actor ignores rests on that: an event names one
+    /// connection, and arrives only when nothing uses it any more.
+    #[test]
+    fn the_last_reference_reports_the_connection_unused() {
+        let peer = SecretKey::from_bytes(&[5u8; 32]).public();
+        let conn_id = ConnId {
+            peer,
+            generation: Generation(7),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let counter = ConnectionCounter::new(conn_id, tx.clone());
+
+        let permit = counter.get_one();
+        let clone = permit.clone();
+        drop(permit);
+        assert!(rx.try_recv().is_err(), "reported unused while in use");
+        drop(clone);
+        assert!(
+            matches!(rx.try_recv(), Ok(Event::Unused(unused)) if unused == conn_id),
+            "the last reference did not report the connection unused"
+        );
+
+        // A connection the pool has closed never counts as going unused.
+        let counter = ConnectionCounter::new(conn_id, tx);
+        counter.mark_closed();
+        drop(counter.get_one());
+        assert!(
+            rx.try_recv().is_err(),
+            "a closed connection reported unused"
         );
     }
 
