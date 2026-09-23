@@ -38,7 +38,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace};
 
 pub type OnConnected = Arc<
-    dyn Fn(&Endpoint, &WeakConnectionRef) -> n0_future::future::Boxed<io::Result<()>> + Send + Sync,
+    dyn Fn(&Endpoint, &ConnectionRef) -> n0_future::future::Boxed<io::Result<()>> + Send + Sync,
 >;
 
 /// The pool is a single actor, so we can afford a larger inbox.
@@ -67,7 +67,17 @@ pub struct Options {
     /// stall the whole pool.
     ///
     /// It also runs for connections handed to [`ConnectionPool::handle_connection`],
-    /// within [`Options::connect_timeout`] as well.
+    /// within [`Options::connect_timeout`] as well. Which of the two it is
+    /// running for is [`Connection::side`]: `Client` for a connection the pool
+    /// dialed, `Server` for one the peer opened.
+    ///
+    /// The [`ConnectionRef`] it receives counts as a use of the connection, and
+    /// is dropped when the callback returns. Hand a [`WeakConnectionRef`], via
+    /// [`ConnectionRef::downgrade`], to anything that outlives the callback and
+    /// only watches the connection rather than using it: a task that holds a
+    /// [`ConnectionRef`] keeps the connection in use for as long as it runs, so
+    /// the connection never counts as unused and the pool neither closes nor
+    /// evicts it.
     #[debug(skip)]
     pub on_connected: Option<OnConnected>,
 }
@@ -87,7 +97,7 @@ impl Options {
     /// Set the on_connected callback
     pub fn with_on_connected<F, Fut>(mut self, f: F) -> Self
     where
-        F: Fn(Endpoint, WeakConnectionRef) -> Fut + Send + Sync + 'static,
+        F: Fn(Endpoint, ConnectionRef) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = io::Result<()>> + Send + 'static,
     {
         self.on_connected = Some(Arc::new(move |ep, conn| {
@@ -154,9 +164,11 @@ impl ConnectionRef {
 /// closed it, or it has closed otherwise. Unlike `Weak`, it keeps the
 /// connection handle itself alive, and it derefs to the connection.
 ///
-/// [`Options::on_connected`] receives one. Work that should keep the connection
-/// open upgrades it, and that includes serving streams the remote opened: the
-/// remote may keep using a connection the pool has superseded.
+/// A task that outlives [`Options::on_connected`] and only watches the
+/// connection takes one, via [`ConnectionRef::downgrade`]. Work that should
+/// keep the connection open upgrades it, and that includes serving streams the
+/// remote opened: the remote may keep using a connection the pool has
+/// superseded.
 #[derive(Debug, Clone)]
 pub struct WeakConnectionRef {
     connection: Connection,
@@ -172,13 +184,6 @@ impl Deref for WeakConnectionRef {
 }
 
 impl WeakConnectionRef {
-    fn new(connection: &Connection, counter: &ConnectionCounter) -> Self {
-        Self {
-            connection: connection.clone(),
-            counter: counter.clone(),
-        }
-    }
-
     /// Returns a reference that keeps the connection in use, if it is still open.
     ///
     /// Returns `None` once the pool has closed the connection, or it has closed
@@ -581,7 +586,13 @@ impl Actor {
                 let counter = ConnectionCounter::new(id, generation, unused_tx);
                 connected = Some((conn.clone(), counter.clone()));
                 if let Some(f) = &on_connected {
-                    f(&endpoint, &WeakConnectionRef::new(&conn, &counter))
+                    // The reference is dropped when the callback returns, so
+                    // the connection is unused again unless the callback kept
+                    // one. Its drop sends an unused event for a connection the
+                    // pool does not hold yet, which the actor ignores;
+                    // `insert_ready` lists the connection as unused itself.
+                    let conn_ref = ConnectionRef::new(conn.clone(), counter.get_one());
+                    f(&endpoint, &conn_ref)
                         .await
                         .map_err(PoolConnectError::from)?;
                 }
@@ -1001,6 +1012,11 @@ impl ConnectionPool {
     /// if it is still in use. Requests waiting for a connection to `id` fail with
     /// [`PoolConnectError::Closed`]. Requests made after this call get a new
     /// connection.
+    ///
+    /// A dial or an adoption that is still running is not closed right here:
+    /// its connection only exists inside the attempt. The attempt's result is
+    /// discarded when it arrives, and the connection is closed then, so within
+    /// [`Options::connect_timeout`].
     pub async fn close(&self, id: EndpointId) -> std::result::Result<(), ConnectionPoolError> {
         self.tx
             .send(ActorMessage::ConnectionShutdown { id })
@@ -1151,7 +1167,7 @@ mod tests {
 
     use super::{
         Actor, ConnectionCounter, ConnectionPool, ConnectionRef, OnConnected, Options, PeerState,
-        PoolConnectError, RequestRef, WeakConnectionRef,
+        PoolConnectError, RequestRef,
     };
 
     const ECHO_ALPN: &[u8] = b"echo";
@@ -1391,7 +1407,7 @@ mod tests {
             .address_lookup(address_lookup)
             .bind()
             .await?;
-        let on_connected = |_, conn: WeakConnectionRef| async move {
+        let on_connected = |_, conn: ConnectionRef| async move {
             let mut stream = conn.paths_stream();
             while let Some(paths) = stream.next().await {
                 if paths.iter().any(|path| path.is_ip()) {
@@ -1927,8 +1943,8 @@ mod tests {
             ECHO_ALPN,
             test_options().with_on_connected({
                 let kept = kept.clone();
-                move |_, conn: WeakConnectionRef| {
-                    *kept.lock().expect("poisoned") = Some(conn);
+                move |_, conn: ConnectionRef| {
+                    *kept.lock().expect("poisoned") = Some(conn.downgrade());
                     async { Err(io::Error::other("on_connect failed")) }
                 }
             }),
@@ -1972,8 +1988,8 @@ mod tests {
             }
             .with_on_connected({
                 let kept = kept.clone();
-                move |_, conn: WeakConnectionRef| {
-                    *kept.lock().expect("poisoned") = Some(conn);
+                move |_, conn: ConnectionRef| {
+                    *kept.lock().expect("poisoned") = Some(conn.downgrade());
                     async { Ok(()) }
                 }
             }),
@@ -2175,16 +2191,14 @@ mod tests {
     /// A reference taken in `on_connected` keeps a superseded connection open.
     ///
     /// This is how streams the remote opened stay served: whatever accepts them
-    /// holds the [`WeakConnectionRef`] and upgrades it per stream.
+    /// keeps a [`ConnectionRef`] for as long as it uses the connection.
     #[tokio::test]
     async fn on_connected_ref_keeps_superseded_connection_open() -> TestResult<()> {
         let held = Arc::new(std::sync::Mutex::new(Vec::new()));
         let options = short_idle_options().with_on_connected({
             let held = held.clone();
-            move |_ep, conn: WeakConnectionRef| {
-                held.lock()
-                    .expect("poisoned")
-                    .push(conn.upgrade().expect("open"));
+            move |_ep, conn: ConnectionRef| {
+                held.lock().expect("poisoned").push(conn.clone());
                 async { Ok(()) }
             }
         });
@@ -2213,8 +2227,8 @@ mod tests {
         let handle = Arc::new(std::sync::Mutex::new(None));
         let options = short_idle_options().with_on_connected({
             let handle = handle.clone();
-            move |_ep, conn: WeakConnectionRef| {
-                *handle.lock().expect("poisoned") = Some(conn);
+            move |_ep, conn: ConnectionRef| {
+                *handle.lock().expect("poisoned") = Some(conn.downgrade());
                 async { Ok(()) }
             }
         });
@@ -2339,7 +2353,7 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let options = short_idle_options().with_on_connected({
             let calls = calls.clone();
-            move |_ep, _conn: WeakConnectionRef| {
+            move |_ep, _conn: ConnectionRef| {
                 let first = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
                 async move {
                     if !first {
@@ -2394,8 +2408,8 @@ mod tests {
         }
         .with_on_connected({
             let handle = handle.clone();
-            move |_ep, conn: WeakConnectionRef| {
-                *handle.lock().expect("poisoned") = Some(conn);
+            move |_ep, conn: ConnectionRef| {
+                *handle.lock().expect("poisoned") = Some(conn.downgrade());
                 async { Ok(()) }
             }
         });
@@ -2492,8 +2506,8 @@ mod tests {
         let handle = Arc::new(std::sync::Mutex::new(None));
         let options = short_idle_options().with_on_connected({
             let handle = handle.clone();
-            move |_ep, conn: WeakConnectionRef| {
-                *handle.lock().expect("poisoned") = Some(conn);
+            move |_ep, conn: ConnectionRef| {
+                *handle.lock().expect("poisoned") = Some(conn.downgrade());
                 async { Ok(()) }
             }
         });
