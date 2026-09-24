@@ -467,12 +467,14 @@ impl Attempt {
         }
     }
 
-    /// Closes the connection the attempt has made, if it has one.
+    /// Closes the connection the attempt has made, or will make.
     ///
-    /// The attempt itself runs until it finishes, and its result is discarded.
+    /// The counter is marked closed either way. A dial that connects afterwards
+    /// sees the mark and closes the connection itself. The attempt runs until
+    /// it finishes, and its result is discarded.
     fn close_as(&self, reason: CloseReason) {
+        self.counter.mark_closed();
         if let Some(connection) = &self.connection {
-            self.counter.mark_closed();
             close_connection(connection, reason);
         }
     }
@@ -940,6 +942,14 @@ impl Actor {
                         // Hand the connection to the pool before `on_connected`
                         // runs, so that it can close it in the meantime.
                         let _ = events_tx.send(Event::Connected(conn_id, connection.clone()));
+                        // The pool may have closed the peer while we dialed. It
+                        // marks the counter before it looks for a connection to
+                        // close, and we send the connection before we look at
+                        // the mark, so one of us sees the other.
+                        if counter.is_closed() {
+                            close_connection(&connection, CloseReason::Closed);
+                            return Err(e!(PoolConnectError::Closed));
+                        }
                         connection
                     }
                 };
@@ -1293,10 +1303,6 @@ impl ConnectionPool {
 ///
 /// It lives in the same atomic as the count, so closing an idle connection and
 /// taking a reference to it cannot both succeed.
-/// The bit of [`ConnectionCounterInner::count`] that marks the connection closed.
-///
-/// It lives in the same atomic as the count, so closing an idle connection and
-/// taking a reference to it cannot both succeed.
 const CLOSED: usize = 1 << (usize::BITS - 1);
 
 #[derive(Debug)]
@@ -1375,6 +1381,11 @@ impl ConnectionCounter {
     /// Marks the connection closed, whether or not it is in use.
     fn mark_closed(&self) {
         self.inner.count.fetch_or(CLOSED, Ordering::SeqCst);
+    }
+
+    /// Returns whether the pool has closed the connection.
+    fn is_closed(&self) -> bool {
+        self.inner.count.load(Ordering::SeqCst) & CLOSED != 0
     }
 
     /// Marks that a newer connection to the peer took this one's place.
@@ -2673,6 +2684,41 @@ mod tests {
             connections[2].close_reason().is_none(),
             "closed the current connection"
         );
+        server.close().await;
+        Ok(())
+    }
+
+    /// A dial that connects after its peer was closed closes the connection.
+    ///
+    /// The pool has nothing to close while the dial is still connecting, so it
+    /// marks the attempt instead, and the dial acts on the mark.
+    #[tokio::test]
+    async fn a_dial_that_connects_after_close_closes_the_connection() -> TestResult<()> {
+        let server = incoming_server().await?;
+        let client = iroh::Endpoint::bind(presets::Minimal).await?;
+        let lookup = MemoryLookup::new();
+        lookup.add_endpoint_info(server.addr());
+        client.address_lookup()?.add(lookup);
+        let pool = ConnectionPool::new(client.clone(), INCOMING_ALPN, short_idle_options());
+
+        let dial = tokio::spawn({
+            let pool = pool.clone();
+            let id = server.id();
+            async move { pool.get_or_connect(id).await }
+        });
+        // The handshake does not finish until the server drives it, so the dial
+        // is connecting until `incoming` is awaited.
+        let incoming = server.accept().await.expect("endpoint closed");
+        pool.close(server.id()).await?;
+        n0_future::time::sleep(Duration::from_millis(50)).await;
+        let connection = incoming.await?;
+
+        assert!(
+            matches!(dial.await?, Err(PoolConnectError::Closed { .. })),
+            "the dial did not report the close"
+        );
+        let err = tokio::time::timeout(SHORT_IDLE * 5, connection.closed()).await?;
+        assert_closed_as(&err, CloseReason::Closed);
         server.close().await;
         Ok(())
     }
