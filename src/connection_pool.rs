@@ -47,7 +47,7 @@ const INBOX_CAPACITY: usize = 1024;
 /// Configuration options for the connection pool
 #[derive(derive_more::Debug, Clone)]
 pub struct Options {
-    /// How long to keep unused connections around.
+    /// How long to keep idle connections around.
     ///
     /// Idle here means that there are no [`ConnectionRef`]s alive for the connection,
     /// not that the connection itself is idle.
@@ -57,7 +57,7 @@ pub struct Options {
     /// Maximum number of connections the pool holds.
     ///
     /// Connections a newer one superseded count, since they stay open until
-    /// they are unused. Attempts that are still running do not, so attempts to
+    /// they are idle. Attempts that are still running do not, so attempts to
     /// peers that do not answer cannot take the place of connections.
     pub max_connections: usize,
     /// Maximum number of superseded connections to keep per peer.
@@ -83,7 +83,7 @@ pub struct Options {
     /// [`ConnectionRef::downgrade`], to anything that outlives the callback and
     /// only watches the connection rather than using it: a task that holds a
     /// [`ConnectionRef`] keeps the connection in use for as long as it runs, so
-    /// the connection never counts as unused and the pool neither closes nor
+    /// the connection never counts as idle and the pool neither closes nor
     /// evicts it.
     #[debug(skip)]
     pub on_connected: Option<OnConnected>,
@@ -202,7 +202,7 @@ impl WeakConnectionRef {
     /// Returns a reference that keeps the connection in use, if it is still open.
     ///
     /// Returns `None` once the pool has closed the connection, or it has closed
-    /// otherwise. An upgrade and the pool closing an unused connection cannot
+    /// otherwise. An upgrade and the pool closing an idle connection cannot
     /// both succeed: whichever comes first wins.
     pub fn upgrade(&self) -> Option<ConnectionRef> {
         if self.connection.close_reason().is_some() {
@@ -292,7 +292,7 @@ struct RequestRef {
 #[derive(Debug)]
 enum Event {
     /// The connection has no references left.
-    Unused(ConnId),
+    Idle(ConnId),
     /// An attempt has made its connection, before `on_connected` runs.
     ///
     /// The pool keeps it so that it can close the connection while the attempt
@@ -356,15 +356,15 @@ impl PooledConnection {
     }
 
     /// Returns whether nothing uses the connection.
-    fn is_unused(&self) -> bool {
-        self.counter.is_unused()
+    fn is_idle(&self) -> bool {
+        self.counter.is_idle()
     }
 
     /// Closes the connection, with a reason that says whether it was in use.
     ///
-    /// The reason is `unused` if nothing uses it, and `drop` otherwise.
+    /// The reason is `idle` if nothing uses it, and `drop` otherwise.
     fn close(&self) {
-        let reason: &[u8] = if self.is_unused() { b"unused" } else { b"drop" };
+        let reason: &[u8] = if self.is_idle() { b"idle" } else { b"drop" };
         self.close_as(reason);
     }
 
@@ -377,12 +377,12 @@ impl PooledConnection {
     /// Closes the connection if nothing uses it, and returns whether it did.
     ///
     /// Upgrading a [`WeakConnectionRef`] does not go through the pool, so a
-    /// connection the pool thinks is unused may be in use again. The counter
+    /// connection the pool thinks is idle may be in use again. The counter
     /// decides the race: whichever of the two comes first wins.
-    fn close_if_unused(&self) -> bool {
-        let closed = self.counter.try_close_unused();
+    fn close_if_idle(&self) -> bool {
+        let closed = self.counter.try_close_idle();
         if closed {
-            self.connection.close(0u32.into(), b"unused");
+            self.connection.close(0u32.into(), b"idle");
         }
         closed
     }
@@ -444,7 +444,7 @@ struct Peer {
     adopting: Vec<Attempt>,
     /// Connections that a newer one took the place of, oldest first.
     ///
-    /// The peer may still be using one, so it stays open until it is unused
+    /// The peer may still be using one, so it stays open until it is idle
     /// for [`Options::idle_timeout`], as a current connection would.
     superseded: Vec<PooledConnection>,
 }
@@ -541,20 +541,20 @@ impl Peer {
     }
 }
 
-/// The connections nothing uses, in the order they went unused.
+/// The connections nothing uses, in the order they went idle.
 ///
-/// The pool closes a connection once it has been unused for
-/// [`Options::idle_timeout`], and evicts the one that has been unused longest
+/// The pool closes a connection once it has been idle for
+/// [`Options::idle_timeout`], and evicts the one that has been idle longest
 /// to make room. Entries are keyed both ways, so a connection's entry can be
 /// found and removed without a scan.
 #[derive(Debug, Default)]
-struct IdleSet {
+struct IdleQueue {
     since: HashMap<ConnId, Instant>,
     order: BTreeSet<(Instant, ConnId)>,
 }
 
-impl IdleSet {
-    /// Records that the connection went unused at `now`.
+impl IdleQueue {
+    /// Records that the connection went idle at `now`.
     fn insert(&mut self, conn_id: ConnId, now: Instant) {
         self.remove(conn_id);
         self.since.insert(conn_id, now);
@@ -568,19 +568,19 @@ impl IdleSet {
         }
     }
 
-    /// Returns when the connection that has been unused longest went unused.
+    /// Returns when the connection that has been idle longest went idle.
     fn oldest(&self) -> Option<Instant> {
         self.order.first().map(|(since, _)| *since)
     }
 
-    /// Removes and returns the connection that has been unused longest.
+    /// Removes and returns the connection that has been idle longest.
     fn pop_oldest(&mut self) -> Option<ConnId> {
         let (_, conn_id) = self.order.pop_first()?;
         self.since.remove(&conn_id);
         Some(conn_id)
     }
 
-    /// Removes and returns a connection that has been unused for `timeout`.
+    /// Removes and returns a connection that has been idle for `timeout`.
     fn pop_expired(&mut self, now: Instant, timeout: Duration) -> Option<ConnId> {
         let (since, conn_id) = *self.order.first()?;
         if since + timeout > now {
@@ -591,7 +591,7 @@ impl IdleSet {
         Some(conn_id)
     }
 
-    /// Returns the unused connections, the one unused longest first.
+    /// Returns the idle connections, the one idle longest first.
     fn iter(&self) -> impl Iterator<Item = ConnId> + '_ {
         self.order.iter().map(|(_, conn_id)| *conn_id)
     }
@@ -607,7 +607,7 @@ struct Actor {
     events_rx: mpsc::UnboundedReceiver<Event>,
     /// Sender for the event inbox, cloned into each connection counter.
     ///
-    /// This is unbounded so it can be used in Drop. It holds at most one unused
+    /// This is unbounded so it can be used in Drop. It holds at most one idle
     /// event per connection, and the actor drains it before anything else.
     events_tx: mpsc::UnboundedSender<Event>,
     options: Options,
@@ -620,7 +620,7 @@ struct Actor {
     /// This is what [`Options::max_connections`] limits.
     held: usize,
     /// The connections nothing uses, oldest first.
-    idle: IdleSet,
+    idle: IdleQueue,
     /// Futures for the attempts that are running.
     connecting: FuturesUnordered<Boxed<ConnectResult>>,
     /// Futures that wait for a connection to close, each yielding which one.
@@ -647,7 +647,7 @@ impl Actor {
                 alpn: alpn.to_vec().into(),
                 peers: HashMap::new(),
                 held: 0,
-                idle: IdleSet::default(),
+                idle: IdleQueue::default(),
                 connecting: FuturesUnordered::new(),
                 conn_close: FuturesUnordered::new(),
                 next_generation: Generation(0),
@@ -683,7 +683,7 @@ impl Actor {
                     self.handle_conn_closed(conn_id);
                 }
 
-                _ = next_idle_timeout => self.close_unused(),
+                _ = next_idle_timeout => self.close_idle(),
 
                 msg = self.rx.recv() => {
                     let Some(msg) = msg else { break };
@@ -710,7 +710,7 @@ impl Actor {
 
     fn handle_event(&mut self, event: Event) {
         match event {
-            Event::Unused(conn_id) => self.handle_unused(conn_id),
+            Event::Idle(conn_id) => self.handle_idle(conn_id),
             Event::Connected(conn_id, connection) => self.handle_connected(conn_id, connection),
         }
     }
@@ -830,16 +830,16 @@ impl Actor {
             return true;
         }
         // A connection on the idle list may be in use again, through an upgrade
-        // that did not go through the pool, so only an unused one is room.
+        // that did not go through the pool, so only an idle one is room.
         self.idle.iter().any(|conn_id| {
             self.connection(conn_id)
-                .is_some_and(PooledConnection::is_unused)
+                .is_some_and(PooledConnection::is_idle)
         })
     }
 
     /// Makes room for one more connection if the pool is full.
     ///
-    /// Evicts the connections that have been unused the longest, and returns
+    /// Evicts the connections that have been idle the longest, and returns
     /// `false` if there is nothing to evict.
     fn make_room(&mut self) -> bool {
         while self.held >= self.options.max_connections {
@@ -852,10 +852,10 @@ impl Actor {
             // A connection on the idle list may be in use again, through an
             // upgrade that did not go through the pool. Its next drop to zero
             // lists it again.
-            if !conn.close_if_unused() {
+            if !conn.close_if_idle() {
                 continue;
             }
-            debug!(%conn_id, "evicting the connection unused longest to make room");
+            debug!(%conn_id, "evicting the connection idle longest to make room");
             self.remove_connection(conn_id);
         }
         true
@@ -991,7 +991,7 @@ impl Actor {
             Some(Current::Ready(previous)) => {
                 // Two endpoints that dial each other at once each keep the
                 // connection they saw last, and may disagree, so the peer can
-                // still be using this one. It closes when it is unused, like
+                // still be using this one. It closes when it is idle, like
                 // any other connection the pool holds.
                 debug!(%conn_id, "the new connection supersedes the current one");
                 previous.counter.mark_superseded();
@@ -1011,7 +1011,7 @@ impl Actor {
         self.held += 1;
         for tx in waiters {
             // A caller that is gone takes no reference: it would put the
-            // connection in use and send an unused event when it drops.
+            // connection in use and send an idle event when it drops.
             if tx.is_closed() {
                 continue;
             }
@@ -1027,7 +1027,7 @@ impl Actor {
                 conn_id
             }
         }));
-        if conn.is_unused() {
+        if conn.is_idle() {
             self.idle.insert(conn_id, Instant::now());
         }
         self.close_oldest_superseded(conn_id.peer);
@@ -1036,7 +1036,7 @@ impl Actor {
     /// Closes the peer's superseded connections beyond the cap.
     ///
     /// A peer that opens connections in a loop would otherwise make the pool
-    /// hold one per attempt, each until it goes unused. The oldest are closed,
+    /// hold one per attempt, each until it goes idle. The oldest are closed,
     /// in use or not, as [`ConnectionPool::close`] closes them.
     fn close_oldest_superseded(&mut self, id: EndpointId) {
         loop {
@@ -1062,25 +1062,25 @@ impl Actor {
         }
     }
 
-    /// Handles a connection going unused.
+    /// Handles a connection going idle.
     ///
     /// An event for a connection the pool no longer holds is ignored:
     /// references to it can outlive it, and their last drop must not restart
     /// another connection's idle timeout.
-    fn handle_unused(&mut self, conn_id: ConnId) {
+    fn handle_idle(&mut self, conn_id: ConnId) {
         let Some(conn) = self.connection(conn_id) else {
             return;
         };
         // The connection was handed out again in the meantime.
-        if !conn.is_unused() {
+        if !conn.is_idle() {
             return;
         }
         self.idle.insert(conn_id, Instant::now());
-        trace!(%conn_id, "connection unused");
+        trace!(%conn_id, "connection idle");
     }
 
-    /// Closes the connections that have been unused for the idle timeout.
-    fn close_unused(&mut self) {
+    /// Closes the connections that have been idle for the idle timeout.
+    fn close_idle(&mut self) {
         let now = Instant::now();
         let timeout = self.options.idle_timeout;
         while let Some(conn_id) = self.idle.pop_expired(now, timeout) {
@@ -1090,10 +1090,10 @@ impl Actor {
             // A connection on the idle list may be in use again, through an
             // upgrade that did not go through the pool. Its next drop to zero
             // lists it again.
-            if !conn.close_if_unused() {
+            if !conn.close_if_idle() {
                 continue;
             }
-            trace!(%conn_id, "unused timeout, closing");
+            trace!(%conn_id, "idle timeout, closing");
             self.remove_connection(conn_id);
         }
     }
@@ -1201,7 +1201,7 @@ impl ConnectionPool {
     /// The previous connection is not closed right away. Two endpoints that dial
     /// each other at once each keep the connection they saw last, and may
     /// disagree, so the remote can still be using the one we superseded. It is
-    /// closed when it is unused instead, like any connection the pool holds.
+    /// closed when it is idle instead, like any connection the pool holds.
     ///
     /// The pool does not check the connection's ALPN.
     pub async fn handle_connection(
@@ -1239,11 +1239,11 @@ impl ConnectionPool {
 
 /// The bit of [`ConnectionCounterInner::count`] that marks the connection closed.
 ///
-/// It lives in the same atomic as the count, so closing an unused connection and
+/// It lives in the same atomic as the count, so closing an idle connection and
 /// taking a reference to it cannot both succeed.
 /// The bit of [`ConnectionCounterInner::count`] that marks the connection closed.
 ///
-/// It lives in the same atomic as the count, so closing an unused connection and
+/// It lives in the same atomic as the count, so closing an idle connection and
 /// taking a reference to it cannot both succeed.
 const CLOSED: usize = 1 << (usize::BITS - 1);
 
@@ -1284,7 +1284,7 @@ impl ConnectionCounter {
         self.inner.count.load(Ordering::SeqCst) & !CLOSED
     }
 
-    fn is_unused(&self) -> bool {
+    fn is_idle(&self) -> bool {
         self.current() == 0
     }
 
@@ -1309,11 +1309,11 @@ impl ConnectionCounter {
         })
     }
 
-    /// Marks an unused connection closed, and returns whether it was unused.
+    /// Marks an idle connection closed, and returns whether it was idle.
     ///
     /// If it returns `false`, a reference was taken in the meantime and the
     /// connection stays open.
-    fn try_close_unused(&self) -> bool {
+    fn try_close_idle(&self) -> bool {
         self.inner
             .count
             .compare_exchange(0, CLOSED, Ordering::SeqCst, Ordering::SeqCst)
@@ -1352,7 +1352,7 @@ impl OneConnection {
 impl Clone for OneConnection {
     fn clone(&self) -> Self {
         // The count is at least one while `self` lives, so a clone never takes
-        // a connection off the unused list behind the pool's back.
+        // a connection off the idle list behind the pool's back.
         self.inner.count.fetch_add(1, Ordering::SeqCst);
         Self {
             inner: self.inner.clone(),
@@ -1362,10 +1362,10 @@ impl Clone for OneConnection {
 
 impl Drop for OneConnection {
     fn drop(&mut self) {
-        // A closed connection never counts as going unused: `CLOSED` is set.
+        // A closed connection never counts as going idle: `CLOSED` is set.
         if self.inner.count.fetch_sub(1, Ordering::SeqCst) == 1 {
-            // Tell the actor that the connection is unused.
-            let _ = self.inner.events_tx.send(Event::Unused(self.inner.conn_id));
+            // Tell the actor that the connection is idle.
+            let _ = self.inner.events_tx.send(Event::Idle(self.inner.conn_id));
         }
     }
 }
@@ -1584,10 +1584,10 @@ mod tests {
         Ok(())
     }
 
-    /// Tests that unused connections are being reclaimed to make room if we hit the
+    /// Tests that idle connections are being reclaimed to make room if we hit the
     /// maximum connection limit.
     #[tokio::test]
-    async fn connection_pool_unused() -> TestResult<()> {
+    async fn idle_connections_make_room() -> TestResult<()> {
         let n = 32;
         let (ids, routers, address_lookup) = echo_servers(n).await?;
         let endpoint = iroh::Endpoint::builder(presets::Minimal)
@@ -2202,7 +2202,7 @@ mod tests {
 
     /// Using a connection again restarts its idle timeout.
     ///
-    /// The connection is closed `idle_timeout` after it last went unused, not
+    /// The connection is closed `idle_timeout` after it last went idle, not
     /// after it first did.
     #[tokio::test]
     async fn use_restarts_the_idle_timeout() -> TestResult<()> {
@@ -2256,13 +2256,13 @@ mod tests {
         Ok(())
     }
 
-    /// A stale unused event leaves the current connection's idle time alone.
+    /// A stale idle event leaves the current connection's idle time alone.
     ///
     /// The event is for a connection the peer no longer has. References to a
     /// replaced connection can outlive it, and when the last one drops, its
     /// event names the peer, whose current connection is another.
     #[tokio::test]
-    async fn stale_unused_event_keeps_the_idle_time() -> TestResult<()> {
+    async fn stale_idle_event_keeps_the_idle_time() -> TestResult<()> {
         let (ids, routers, address_lookup) = echo_servers(1).await?;
         let id = ids[0];
         let endpoint = iroh::Endpoint::builder(presets::Minimal)
@@ -2273,17 +2273,17 @@ mod tests {
         let conn = endpoint.connect(id, ECHO_ALPN).await?;
         let (mut actor, _tx) = Actor::new(endpoint.clone(), ECHO_ALPN, test_options());
         let conn_id = insert_ready(&mut actor, &conn);
-        let since = actor.idle.oldest().expect("the connection is unused");
+        let since = actor.idle.oldest().expect("the connection is idle");
 
-        actor.handle_unused(stale_conn_id(id));
+        actor.handle_idle(stale_conn_id(id));
         assert_eq!(
             actor.idle.oldest(),
             Some(since),
-            "a stale unused event restarted the idle timeout"
+            "a stale idle event restarted the idle timeout"
         );
-        actor.handle_unused(conn_id);
+        actor.handle_idle(conn_id);
         assert!(
-            actor.idle.oldest().expect("still unused") >= since,
+            actor.idle.oldest().expect("still idle") >= since,
             "the connection's own event was ignored"
         );
 
@@ -2361,9 +2361,9 @@ mod tests {
         );
     }
 
-    /// Asserts that the pool closed a connection because it was unused.
-    fn assert_closed_as_unused(err: &iroh::endpoint::ConnectionError) {
-        assert_closed_as(err, b"unused");
+    /// Asserts that the pool closed a connection because it was idle.
+    fn assert_closed_as_idle(err: &iroh::endpoint::ConnectionError) {
+        assert_closed_as(err, b"idle");
     }
 
     fn short_idle_options() -> Options {
@@ -2591,7 +2591,7 @@ mod tests {
     /// The pool keeps at most `max_superseded_per_peer` superseded connections.
     ///
     /// A peer that opens connections in a loop would otherwise make the pool
-    /// hold one per attempt, each until it goes unused.
+    /// hold one per attempt, each until it goes idle.
     #[tokio::test]
     async fn superseded_connections_are_capped() -> TestResult<()> {
         let options = Options {
@@ -2607,7 +2607,7 @@ mod tests {
         for _ in 0..3 {
             let (outgoing, conn_ref) = Superseded::connect(&client, &server, &pool).await?;
             connections.push(outgoing);
-            // Hold each one, so nothing closes for being unused.
+            // Hold each one, so nothing closes for being idle.
             refs.push(conn_ref);
         }
 
@@ -2641,12 +2641,12 @@ mod tests {
 
     /// A superseded connection is closed once nothing uses it.
     #[tokio::test]
-    async fn superseded_connection_is_closed_once_unused() -> TestResult<()> {
+    async fn superseded_connection_is_closed_once_idle() -> TestResult<()> {
         let s = Superseded::new(short_idle_options()).await?;
         drop(s.first_ref);
 
         let err = tokio::time::timeout(SHORT_IDLE * 10, s.first.closed()).await?;
-        assert_closed_as_unused(&err);
+        assert_closed_as_idle(&err);
         assert!(
             s.second.close_reason().is_none(),
             "the new connection was closed"
@@ -2698,16 +2698,16 @@ mod tests {
 
         held.lock().expect("poisoned").clear();
         let err = tokio::time::timeout(SHORT_IDLE * 10, s.first.closed()).await?;
-        assert_closed_as_unused(&err);
+        assert_closed_as_idle(&err);
         Ok(())
     }
 
-    /// An upgraded [`WeakConnectionRef`] keeps an unused connection open.
+    /// An upgraded [`WeakConnectionRef`] keeps an idle connection open.
     ///
     /// Upgrading does not go through the pool, so the connection is still on
-    /// the unused list when its idle timeout passes.
+    /// the idle list when its idle timeout passes.
     #[tokio::test]
-    async fn upgrade_after_unused_keeps_connection_open() -> TestResult<()> {
+    async fn upgrade_after_idle_keeps_connection_open() -> TestResult<()> {
         let handle = Arc::new(std::sync::Mutex::new(None));
         let options = short_idle_options().with_on_connected({
             let handle = handle.clone();
@@ -2881,7 +2881,7 @@ mod tests {
     /// An upgraded [`WeakConnectionRef`] put it back in use.
     ///
     /// Such a reference does not go through the pool, so the peer is still on
-    /// the list of unused peers that eviction picks from.
+    /// the list of idle peers that eviction picks from.
     #[tokio::test]
     async fn eviction_skips_a_peer_in_use_again() -> TestResult<()> {
         let handle = Arc::new(std::sync::Mutex::new(None));
@@ -2905,7 +2905,7 @@ mod tests {
         let pool = ConnectionPool::new(server.clone(), INCOMING_ALPN, options);
         let (outgoing, conn_ref) = Superseded::connect(&client, &server, &pool).await?;
         drop(conn_ref);
-        // Let the pool see the peer go unused before the reference comes in.
+        // Let the pool see the peer go idle before the reference comes in.
         n0_future::time::sleep(Duration::from_millis(50)).await;
         let handle = handle.lock().expect("poisoned").take().expect("no handle");
         let stream_ref = handle.upgrade().expect("open");
@@ -2934,7 +2934,7 @@ mod tests {
         drop(s.first_ref);
 
         let err = tokio::time::timeout(SHORT_IDLE * 10, s.first.closed()).await?;
-        assert_closed_as_unused(&err);
+        assert_closed_as_idle(&err);
         drop(weak);
         Ok(())
     }
@@ -2953,11 +2953,11 @@ mod tests {
         );
         drop(clone);
         let err = tokio::time::timeout(SHORT_IDLE * 10, s.first.closed()).await?;
-        assert_closed_as_unused(&err);
+        assert_closed_as_idle(&err);
         Ok(())
     }
 
-    /// An upgrade and the pool closing an unused connection cannot both succeed.
+    /// An upgrade and the pool closing an idle connection cannot both succeed.
     ///
     /// Whichever comes first wins: an upgrade keeps the pool from closing the
     /// connection, and a close makes later upgrades fail.
@@ -2968,9 +2968,9 @@ mod tests {
 
         let counter = ConnectionCounter::new(stale_conn_id(id), tx.clone());
         let permit = counter.try_get_one().expect("open connection");
-        assert!(!counter.try_close_unused(), "closed a connection in use");
+        assert!(!counter.try_close_idle(), "closed a connection in use");
         drop(permit);
-        assert!(counter.try_close_unused());
+        assert!(counter.try_close_idle());
         assert!(
             counter.try_get_one().is_none(),
             "upgraded a closed connection"
@@ -2984,12 +2984,12 @@ mod tests {
         );
     }
 
-    /// The last reference to drop reports which connection went unused.
+    /// The last reference to drop reports which connection went idle.
     ///
     /// Every stale event the actor ignores rests on that: an event names one
     /// connection, and arrives only when nothing uses it any more.
     #[test]
-    fn the_last_reference_reports_the_connection_unused() {
+    fn the_last_reference_reports_the_connection_idle() {
         let peer = SecretKey::from_bytes(&[5u8; 32]).public();
         let conn_id = ConnId {
             peer,
@@ -3001,21 +3001,18 @@ mod tests {
         let permit = counter.get_one();
         let clone = permit.clone();
         drop(permit);
-        assert!(rx.try_recv().is_err(), "reported unused while in use");
+        assert!(rx.try_recv().is_err(), "reported idle while in use");
         drop(clone);
         assert!(
-            matches!(rx.try_recv(), Ok(Event::Unused(unused)) if unused == conn_id),
-            "the last reference did not report the connection unused"
+            matches!(rx.try_recv(), Ok(Event::Idle(idle)) if idle == conn_id),
+            "the last reference did not report the connection idle"
         );
 
-        // A connection the pool has closed never counts as going unused.
+        // A connection the pool has closed never counts as going idle.
         let counter = ConnectionCounter::new(conn_id, tx);
         counter.mark_closed();
         drop(counter.get_one());
-        assert!(
-            rx.try_recv().is_err(),
-            "a closed connection reported unused"
-        );
+        assert!(rx.try_recv().is_err(), "a closed connection reported idle");
     }
 
     /// Upgrading fails once the pool has closed the connection.
