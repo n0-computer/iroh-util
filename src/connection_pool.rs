@@ -26,7 +26,7 @@ use std::{
 
 use iroh::{
     Endpoint, EndpointId,
-    endpoint::{ConnectError, Connection},
+    endpoint::{ConnectError, Connection, VarInt},
 };
 use n0_error::{e, stack_error};
 use n0_future::{
@@ -329,6 +329,56 @@ impl fmt::Display for ConnId {
     }
 }
 
+/// Why the pool closed a connection.
+///
+/// The peer sees the code and the reason, and every close the pool makes names
+/// one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseReason {
+    /// Nothing used it for [`Options::idle_timeout`], or it was evicted.
+    Idle = 0,
+    /// The pool let go of it while it was still in use.
+    ///
+    /// [`ConnectionPool::close`] and the pool shutting down do this, and so
+    /// does the cap on superseded connections.
+    Dropped = 1,
+    /// A newer connection to the peer took its place.
+    Discarded = 2,
+    /// The pool was full when the attempt that made it finished.
+    TooManyConnections = 3,
+    /// [`Options::on_connected`] failed for it, or ran out of time.
+    OnConnectedFailed = 4,
+    /// The peer was closed while the attempt that made it was running.
+    Closed = 5,
+}
+
+impl CloseReason {
+    /// Returns the error code the pool closes with.
+    fn code(self) -> VarInt {
+        VarInt::from_u32(self as u32)
+    }
+
+    /// Returns the reason the pool closes with, which the peer can read.
+    fn reason(self) -> &'static [u8] {
+        match self {
+            Self::Idle => b"idle",
+            Self::Dropped => b"drop",
+            Self::Discarded => b"discarded",
+            Self::TooManyConnections => b"too many connections",
+            Self::OnConnectedFailed => b"on_connected failed",
+            Self::Closed => b"closed",
+        }
+    }
+}
+
+/// Closes `connection`, telling the peer why.
+///
+/// Every connection the pool closes goes through here, so a peer always gets a
+/// [`CloseReason`] rather than a bare code.
+fn close_connection(connection: &Connection, reason: CloseReason) {
+    connection.close(reason.code(), reason.reason());
+}
+
 /// A connection the pool holds, with its reference count.
 #[derive(Debug, Clone)]
 struct PooledConnection {
@@ -361,17 +411,19 @@ impl PooledConnection {
     }
 
     /// Closes the connection, with a reason that says whether it was in use.
-    ///
-    /// The reason is `idle` if nothing uses it, and `drop` otherwise.
     fn close(&self) {
-        let reason: &[u8] = if self.is_idle() { b"idle" } else { b"drop" };
+        let reason = if self.is_idle() {
+            CloseReason::Idle
+        } else {
+            CloseReason::Dropped
+        };
         self.close_as(reason);
     }
 
     /// Closes the connection with `reason`, and fails later upgrades to it.
-    fn close_as(&self, reason: &[u8]) {
+    fn close_as(&self, reason: CloseReason) {
         self.counter.mark_closed();
-        self.connection.close(0u32.into(), reason);
+        close_connection(&self.connection, reason);
     }
 
     /// Closes the connection if nothing uses it, and returns whether it did.
@@ -382,7 +434,7 @@ impl PooledConnection {
     fn close_if_idle(&self) -> bool {
         let closed = self.counter.try_close_idle();
         if closed {
-            self.connection.close(0u32.into(), b"idle");
+            close_connection(&self.connection, CloseReason::Idle);
         }
         closed
     }
@@ -418,10 +470,10 @@ impl Attempt {
     /// Closes the connection the attempt has made, if it has one.
     ///
     /// The attempt itself runs until it finishes, and its result is discarded.
-    fn close_as(&self, reason: &[u8]) {
+    fn close_as(&self, reason: CloseReason) {
         if let Some(connection) = &self.connection {
             self.counter.mark_closed();
-            connection.close(0u32.into(), reason);
+            close_connection(connection, reason);
         }
     }
 }
@@ -910,7 +962,7 @@ impl Actor {
                 && let Some(connection) = connected
             {
                 counter.mark_closed();
-                connection.close(0u32.into(), b"on_connected failed");
+                close_connection(&connection, CloseReason::OnConnectedFailed);
             }
             (conn_id, result)
         })
@@ -939,7 +991,7 @@ impl Actor {
         // The peer was closed while the attempt ran, so nothing will hand this
         // connection out. Its result is discarded when it arrives.
         debug!(%conn_id, "the peer was closed while connecting");
-        connection.close(0u32.into(), b"closed");
+        close_connection(&connection, CloseReason::Closed);
     }
 
     /// Makes the connection an attempt produced the peer's current one.
@@ -956,7 +1008,7 @@ impl Actor {
             // The peer was closed while the attempt ran.
             debug!(%conn_id, "stale connect result, discarding");
             if let Ok(connection) = result {
-                connection.close(0u32.into(), b"discarded");
+                close_connection(&connection, CloseReason::Discarded);
             }
             return;
         };
@@ -975,7 +1027,7 @@ impl Actor {
         // finishes adds one to the connections the pool holds.
         if !self.make_room() {
             debug!(%conn_id, "connected, but the pool is full");
-            conn.close_as(b"too many connections");
+            conn.close_as(CloseReason::TooManyConnections);
             attempt.fail(e!(PoolConnectError::TooManyConnections));
             self.drop_peer_if_empty(conn_id.peer);
             return;
@@ -1002,7 +1054,7 @@ impl Actor {
                 // waiters get this one, and its own connection, if it has made
                 // one, is closed. Its result is discarded when it arrives.
                 debug!(%conn_id, "the new connection serves a running dial");
-                dial.close_as(b"discarded");
+                dial.close_as(CloseReason::Discarded);
                 waiters.extend(dial.waiters);
             }
             None => {}
@@ -1123,7 +1175,7 @@ impl Actor {
         for attempt in attempts {
             // The connection an attempt has made is closed here. The attempt
             // runs to its end, and its result is discarded when it arrives.
-            attempt.close_as(b"closed");
+            attempt.close_as(CloseReason::Closed);
             attempt.fail(cause.clone());
         }
     }
@@ -1393,8 +1445,8 @@ mod tests {
     use tracing::trace;
 
     use super::{
-        Actor, ConnId, ConnectionCounter, ConnectionPool, ConnectionRef, Current, Event,
-        Generation, OnConnected, Options, PoolConnectError, PooledConnection, RequestRef,
+        Actor, CloseReason, ConnId, ConnectionCounter, ConnectionPool, ConnectionRef, Current,
+        Event, Generation, OnConnected, Options, PoolConnectError, PooledConnection, RequestRef,
     };
 
     const ECHO_ALPN: &[u8] = b"echo";
@@ -2350,12 +2402,12 @@ mod tests {
     }
 
     /// Asserts that the pool closed a connection with `reason`.
-    fn assert_closed_as(err: &iroh::endpoint::ConnectionError, reason: &[u8]) {
+    fn assert_closed_as(err: &iroh::endpoint::ConnectionError, reason: CloseReason) {
         assert!(
             matches!(
                 err,
                 iroh::endpoint::ConnectionError::ApplicationClosed(frame)
-                    if frame.reason[..] == *reason
+                    if frame.error_code == reason.code() && frame.reason[..] == *reason.reason()
             ),
             "closed for the wrong reason: {err:?}"
         );
@@ -2363,7 +2415,7 @@ mod tests {
 
     /// Asserts that the pool closed a connection because it was idle.
     fn assert_closed_as_idle(err: &iroh::endpoint::ConnectionError) {
-        assert_closed_as(err, b"idle");
+        assert_closed_as(err, CloseReason::Idle);
     }
 
     fn short_idle_options() -> Options {
@@ -2578,7 +2630,7 @@ mod tests {
 
         pool.close(client.id()).await?;
         let err = tokio::time::timeout(Duration::from_secs(5), outgoing.closed()).await?;
-        assert_closed_as(&err, b"closed");
+        assert_closed_as(&err, CloseReason::Closed);
         let adopted = adopting.await?;
         assert!(
             matches!(adopted, Err(PoolConnectError::Closed { .. })),
@@ -2612,7 +2664,7 @@ mod tests {
         }
 
         let err = tokio::time::timeout(SHORT_IDLE * 5, connections[0].closed()).await?;
-        assert_closed_as(&err, b"drop");
+        assert_closed_as(&err, CloseReason::Dropped);
         assert!(
             connections[1].close_reason().is_none(),
             "closed the connection within the cap"
@@ -2752,14 +2804,7 @@ mod tests {
             let err = tokio::time::timeout(SHORT_IDLE * 2, conn.closed())
                 .await
                 .map_err(|_| format!("the {name} connection was not closed"))?;
-            assert!(
-                matches!(
-                    &err,
-                    iroh::endpoint::ConnectionError::ApplicationClosed(frame)
-                        if &frame.reason[..] == b"drop"
-                ),
-                "the {name} connection was closed for the wrong reason: {err:?}"
-            );
+            assert_closed_as(&err, CloseReason::Dropped);
         }
         Ok(())
     }
