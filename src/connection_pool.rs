@@ -10,15 +10,15 @@
 //! the connection.
 //!
 //! This is using a single actor to manage all connections.
+
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap},
     io,
     ops::Deref,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
 };
 
 use iroh::{
@@ -26,7 +26,11 @@ use iroh::{
     endpoint::{ConnectError, Connection},
 };
 use n0_error::{e, stack_error};
-use n0_future::{FuturesUnordered, StreamExt, future::Boxed, time::Duration};
+use n0_future::{
+    FuturesUnordered, MaybeFuture, StreamExt,
+    future::Boxed,
+    time::{Duration, Instant},
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace};
 
@@ -47,6 +51,9 @@ pub struct Options {
     /// Timeout for connect. This includes the time spent in on_connect, if set.
     pub connect_timeout: Duration,
     /// Maximum number of connections to hand out.
+    ///
+    /// Attempts to connect that are still running do not count, so attempts to
+    /// peers that do not answer cannot take the place of connections.
     pub max_connections: usize,
     /// An optional callback that can be used to wait for the connection to enter some state.
     /// An example usage could be to wait for the connection to become direct before handing
@@ -98,10 +105,10 @@ impl Deref for ConnectionRef {
 }
 
 impl ConnectionRef {
-    fn new(connection: iroh::endpoint::Connection, counter: OneConnection) -> Self {
+    fn new(connection: iroh::endpoint::Connection, permit: OneConnection) -> Self {
         Self {
             connection,
-            _permit: counter,
+            _permit: permit,
         }
     }
 }
@@ -177,6 +184,8 @@ enum PeerState {
     },
     /// We have a connection to the peer.
     Ready {
+        /// The generation of the attempt that made the connection.
+        generation: u64,
         connection: Connection,
         counter: ConnectionCounter,
         unused_since: Option<Instant>,
@@ -189,12 +198,14 @@ struct Actor {
     /// Inbox
     rx: mpsc::Receiver<ActorMessage>,
     /// Separate inbox for unused events, gets processed before the main inbox.
-    unused_rx: mpsc::UnboundedReceiver<EndpointId>,
+    ///
+    /// Each event names the peer and the generation of the connection.
+    unused_rx: mpsc::UnboundedReceiver<(EndpointId, u64)>,
     /// Sender for the unused inbox to be cloned into the connection counter.
     ///
     /// This is unbounded so it can be used in Drop, but it is bounded by the number
     /// of ConnectionRefs we give out, which is bounded by max_connections.
-    unused_tx: mpsc::UnboundedSender<EndpointId>,
+    unused_tx: mpsc::UnboundedSender<(EndpointId, u64)>,
     options: Options,
     endpoint: Endpoint,
     alpn: Arc<[u8]>,
@@ -204,11 +215,15 @@ struct Actor {
     /// Generation counter used to distinguish between connection attempts to the same peer.
     next_generation: u64,
     /// Futures for connection close watchers.
-    conn_close: FuturesUnordered<Boxed<EndpointId>>,
-    /// Futures for cleaning up unused connections after the unused timeout.
-    unused_timers: FuturesUnordered<Boxed<EndpointId>>,
+    ///
+    /// Each yields the peer and the generation of the connection it watches.
+    conn_close: FuturesUnordered<Boxed<(EndpointId, u64)>>,
     /// Currently unused connections, in order of when they became unused.
-    unused: VecDeque<EndpointId>,
+    ///
+    /// Keyed by each peer's `unused_since`, so a peer's entry can be found and
+    /// removed without a scan. The first entry is the next connection to close
+    /// for being unused.
+    unused: BTreeSet<(Instant, EndpointId)>,
 }
 
 impl Actor {
@@ -231,8 +246,7 @@ impl Actor {
                 connecting: FuturesUnordered::new(),
                 next_generation: 0,
                 conn_close: FuturesUnordered::new(),
-                unused_timers: FuturesUnordered::new(),
-                unused: VecDeque::new(),
+                unused: BTreeSet::new(),
             },
             tx,
         )
@@ -242,26 +256,30 @@ impl Actor {
         // We bias processing internal events before accepting more work from
         // the external mailbox.
         loop {
+            let next_unused_timer_at = match self.unused.first() {
+                None => MaybeFuture::None,
+                Some((unused_since, _endpoint_id)) => {
+                    let deadline = *unused_since + self.options.idle_timeout;
+                    MaybeFuture::Some(n0_future::time::sleep_until(deadline))
+                }
+            };
             tokio::select! {
                 biased;
 
                 // Handle unused events first, since this might give us some room.
-                Some(id) = self.unused_rx.recv() => {
-                    self.handle_unused_event(id);
+                Some((id, generation)) = self.unused_rx.recv() => {
+                    self.handle_unused_event(id, generation);
                 }
 
                 Some((id, generation, result)) = self.connecting.next(), if !self.connecting.is_empty() => {
                     self.handle_connect_result(id, generation, result);
                 }
 
-                Some(id) = self.conn_close.next(), if !self.conn_close.is_empty() => {
-                    trace!(%id, "connection closed by peer");
-                    self.remove_peer(id);
+                Some((id, generation)) = self.conn_close.next(), if !self.conn_close.is_empty() => {
+                    self.handle_conn_closed(id, generation);
                 }
 
-                Some(id) = self.unused_timers.next(), if !self.unused_timers.is_empty() => {
-                    self.handle_unused_timer(id);
-                }
+                _ = next_unused_timer_at => self.close_unused(),
 
                 msg = self.rx.recv() => {
                     let Some(msg) = msg else { break };
@@ -306,9 +324,15 @@ impl Actor {
 
     fn handle_request(&mut self, req: RequestRef) {
         let id = req.id;
-        // Remove the id from the unused list,
-        self.unused.retain(|x| *x != id);
-
+        // A connection that closed a moment ago is still the peer's current one
+        // until its close event reaches the actor. Handing it out would give the
+        // caller a connection that fails on first use.
+        if let Some(PeerState::Ready { connection, .. }) = self.peers.get(&id)
+            && connection.close_reason().is_some()
+        {
+            debug!(%id, "current connection has closed, dialing again");
+            self.remove_peer(id);
+        }
         if let Some(state) = self.peers.get_mut(&id) {
             match state {
                 PeerState::Connecting { waiters, .. } => {
@@ -319,8 +343,11 @@ impl Actor {
                     connection,
                     counter,
                     unused_since,
+                    ..
                 } => {
-                    *unused_since = None;
+                    if let Some(since) = unused_since.take() {
+                        self.unused.remove(&(since, id));
+                    }
                     let one = counter.get_one();
                     info!(%id, "Handing out ConnectionRef {}", counter.current());
                     let _ = req.tx.send(Ok(ConnectionRef::new(connection.clone(), one)));
@@ -329,15 +356,9 @@ impl Actor {
             }
         }
 
-        // If we exceed max_connections, do a last attempt to make room, otherwise fail.
-        if self.peers.len() >= self.options.max_connections {
-            if let Some(id) = self.unused.pop_front() {
-                trace!("evicting oldest unused peer {id} to make room");
-                self.remove_peer_inner(id);
-            } else {
-                let _ = req.tx.send(Err(e!(PoolConnectError::TooManyConnections)));
-                return;
-            }
+        if !self.make_room() {
+            let _ = req.tx.send(Err(e!(PoolConnectError::TooManyConnections)));
+            return;
         }
 
         let generation = self.next_generation;
@@ -353,17 +374,48 @@ impl Actor {
             .push(self.make_connect_future(id, generation));
     }
 
+    /// Makes room for one more connection if the pool holds `max_connections`.
+    ///
+    /// Evicts the connection that has been unused the longest, and returns
+    /// `false` if there is none.
+    fn make_room(&mut self) -> bool {
+        let connections = self
+            .peers
+            .values()
+            .filter(|state| matches!(state, PeerState::Ready { .. }))
+            .count();
+        if connections < self.options.max_connections {
+            return true;
+        }
+        let Some((since, id)) = self.unused.pop_first() else {
+            return false;
+        };
+        debug_assert!(
+            matches!(
+                self.peers.get(&id),
+                Some(PeerState::Ready { counter, unused_since: Some(s), .. })
+                    if *s == since && counter.is_unused()
+            ),
+            "the unused list names a peer that is not unused"
+        );
+        trace!("evicting oldest unused peer {id} to make room");
+        self.remove_peer(id);
+        true
+    }
+
     fn make_connect_future(&self, id: EndpointId, generation: u64) -> Boxed<ConnectResult> {
         let endpoint = self.endpoint.clone();
         let alpn = self.alpn.clone();
         let on_connected = self.options.on_connected.clone();
         let connect_timeout = self.options.connect_timeout;
         Box::pin(async move {
+            let mut connected = None;
             let attempt = async {
                 let conn = endpoint
                     .connect(id, &alpn[..])
                     .await
                     .map_err(PoolConnectError::from)?;
+                connected = Some(conn.clone());
                 if let Some(f) = &on_connected {
                     f(&endpoint, &conn).await.map_err(PoolConnectError::from)?;
                 }
@@ -373,6 +425,13 @@ impl Actor {
                 Ok(r) => r,
                 Err(_) => Err(e!(PoolConnectError::Timeout)),
             };
+            // `on_connected` failed or ran out of time. Close the connection
+            // rather than drop it: the callback may have handed it to a task.
+            if result.is_err()
+                && let Some(conn) = connected
+            {
+                conn.close(0u32.into(), b"on_connected failed");
+            }
             (id, generation, result)
         })
     }
@@ -399,40 +458,48 @@ impl Actor {
             return;
         };
         match result {
+            // Connections made since this attempt started may have filled the pool.
+            Ok(conn) if !self.make_room() => {
+                debug!(%id, "connected, but the pool is full");
+                conn.close(0u32.into(), b"too many connections");
+                for tx in waiters {
+                    let _ = tx.send(Err(e!(PoolConnectError::TooManyConnections)));
+                }
+            }
             Ok(conn) => {
-                let counter = ConnectionCounter::new(id, self.unused_tx.clone());
+                let counter = ConnectionCounter::new(id, generation, self.unused_tx.clone());
                 for tx in waiters {
                     if tx.is_closed() {
                         continue;
                     }
-                    let one = counter.get_one();
-                    if tx.send(Ok(ConnectionRef::new(conn.clone(), one))).is_err() {
+                    let permit = counter.get_one();
+                    if tx
+                        .send(Ok(ConnectionRef::new(conn.clone(), permit)))
+                        .is_err()
+                    {
                         // User is no longer interested in the ConnectionRef.
                     }
                 }
                 info!(%id, "connected, {} ref(s) outstanding", counter.current());
 
                 // Create a future that waits for the connection to close.
-                let close_fut: Boxed<EndpointId> = {
+                let close_fut: Boxed<(EndpointId, u64)> = {
                     let conn = conn.clone();
                     Box::pin(async move {
                         conn.closed().await;
-                        id
+                        (id, generation)
                     })
                 };
                 self.conn_close.push(close_fut);
 
-                let unused_since = if counter.is_unused() {
-                    // Schedule an idle timer if it is already unused here.
-                    self.unused.push_back(id);
-                    self.schedule_unused_timer(id);
-                    Some(Instant::now())
-                } else {
-                    None
-                };
+                let unused_since = counter.is_unused().then(Instant::now);
+                if let Some(since) = unused_since {
+                    self.unused.insert((since, id));
+                }
                 self.peers.insert(
                     id,
                     PeerState::Ready {
+                        generation,
                         connection: conn,
                         counter,
                         unused_since,
@@ -448,8 +515,29 @@ impl Actor {
         }
     }
 
-    fn handle_unused_event(&mut self, id: EndpointId) {
+    /// Handles a connection closing, by us or by the peer.
+    ///
+    /// Only acts if the connection is still the peer's current one. One the
+    /// pool replaced has closed already, and must not take down its successor.
+    fn handle_conn_closed(&mut self, id: EndpointId, generation: u64) {
+        let current = matches!(
+            self.peers.get(&id),
+            Some(PeerState::Ready { generation: g, .. }) if *g == generation
+        );
+        if current {
+            trace!(%id, "connection closed");
+            self.remove_peer(id);
+        }
+    }
+
+    /// Handles a connection going unused.
+    ///
+    /// Only acts if the connection is still the peer's current one. References
+    /// to a connection the pool replaced can outlive it, and their last drop
+    /// must not restart its successor's idle timeout.
+    fn handle_unused_event(&mut self, id: EndpointId, generation: u64) {
         let Some(PeerState::Ready {
+            generation: g,
             counter,
             unused_since,
             ..
@@ -457,53 +545,34 @@ impl Actor {
         else {
             return;
         };
+        if *g != generation {
+            return;
+        }
         // Connection was handed out in the meantime.
         if !counter.is_unused() {
             return;
         }
-        *unused_since = Some(Instant::now());
-        self.unused.retain(|x| *x != id);
-        self.unused.push_back(id);
-        trace!(%id, "peer unused");
-        self.schedule_unused_timer(id);
-    }
-
-    fn schedule_unused_timer(&mut self, id: EndpointId) {
-        let timeout = self.options.idle_timeout;
-        let timer: Boxed<EndpointId> = Box::pin(async move {
-            n0_future::time::sleep(timeout).await;
-            id
-        });
-        self.unused_timers.push(timer);
-    }
-
-    fn handle_unused_timer(&mut self, id: EndpointId) {
-        let Some(PeerState::Ready {
-            counter,
-            unused_since,
-            ..
-        }) = self.peers.get(&id)
-        else {
-            // PeerState is no longer what we expect. Either mising entirely
-            // or Connecting. In either case, we must not do anything.
-            return;
-        };
-        if !counter.is_unused() {
-            return;
+        let now = Instant::now();
+        if let Some(since) = unused_since.replace(now) {
+            self.unused.remove(&(since, id));
         }
-        let Some(since) = unused_since else { return };
-        if since.elapsed() >= self.options.idle_timeout {
+        self.unused.insert((now, id));
+        trace!(%id, "peer unused");
+    }
+
+    /// Closes the connections that have been unused for the idle timeout.
+    fn close_unused(&mut self) {
+        let now = Instant::now();
+        while let Some(&(since, id)) = self.unused.first()
+            && since + self.options.idle_timeout <= now
+        {
             trace!(%id, "unused timeout, removing");
-            self.remove_peer_inner(id);
+            self.unused.pop_first();
+            self.remove_peer(id);
         }
     }
 
     fn remove_peer(&mut self, id: EndpointId) {
-        self.remove_peer_inner(id);
-    }
-
-    fn remove_peer_inner(&mut self, id: EndpointId) {
-        self.unused.retain(|x| *x != id);
         if let Some(state) = self.peers.remove(&id) {
             match state {
                 PeerState::Connecting { waiters, .. } => {
@@ -514,6 +583,7 @@ impl Actor {
                 PeerState::Ready {
                     connection,
                     counter,
+                    unused_since,
                     ..
                 } => {
                     let reason: &[u8] = if counter.is_unused() {
@@ -522,6 +592,9 @@ impl Actor {
                         b"drop"
                     };
                     connection.close(0u32.into(), reason);
+                    if let Some(since) = unused_since {
+                        self.unused.remove(&(since, id));
+                    }
                 }
             }
         }
@@ -574,7 +647,9 @@ impl ConnectionPool {
 struct ConnectionCounterInner {
     count: AtomicUsize,
     id: EndpointId,
-    unused_tx: mpsc::UnboundedSender<EndpointId>,
+    /// The generation of the connection, which unused events name.
+    generation: u64,
+    unused_tx: mpsc::UnboundedSender<(EndpointId, u64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -583,11 +658,16 @@ struct ConnectionCounter {
 }
 
 impl ConnectionCounter {
-    fn new(id: EndpointId, unused_tx: mpsc::UnboundedSender<EndpointId>) -> Self {
+    fn new(
+        id: EndpointId,
+        generation: u64,
+        unused_tx: mpsc::UnboundedSender<(EndpointId, u64)>,
+    ) -> Self {
         Self {
             inner: Arc::new(ConnectionCounterInner {
                 count: AtomicUsize::new(0),
                 id,
+                generation,
                 unused_tx,
             }),
         }
@@ -619,14 +699,24 @@ impl Drop for OneConnection {
     fn drop(&mut self) {
         if self.inner.count.fetch_sub(1, Ordering::SeqCst) == 1 {
             // Send an unused event to the actor.
-            let _ = self.inner.unused_tx.send(self.inner.id);
+            let _ = self
+                .inner
+                .unused_tx
+                .send((self.inner.id, self.inner.generation));
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
 
     use iroh::{
         EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr,
@@ -637,9 +727,13 @@ mod tests {
     use n0_error::{AnyError, Result, StdResultExt};
     use n0_future::{BufferedStreamExt, StreamExt, io, stream};
     use testresult::TestResult;
+    use tokio::sync::oneshot;
     use tracing::trace;
 
-    use super::{ConnectionPool, OnConnected, Options, PoolConnectError};
+    use super::{
+        Actor, ConnectionCounter, ConnectionPool, OnConnected, Options, PeerState,
+        PoolConnectError, RequestRef,
+    };
 
     const ECHO_ALPN: &[u8] = b"echo";
 
@@ -922,7 +1016,6 @@ mod tests {
     ) -> Vec<
         tokio::task::JoinHandle<std::result::Result<super::ConnectionRef, super::PoolConnectError>>,
     > {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         let started = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::with_capacity(n);
         for _ in 0..n {
@@ -944,8 +1037,6 @@ mod tests {
     /// in bounded time.
     #[tokio::test]
     async fn connection_pool_dead_peer_backlog_does_not_wedge() -> TestResult<()> {
-        use std::time::Instant;
-
         let (live_ids, routers, address_lookup) = echo_servers(1).await?;
         let live_peer = live_ids[0];
 
@@ -1000,8 +1091,6 @@ mod tests {
     /// must complete within one `connect_timeout` window.
     #[tokio::test]
     async fn connection_pool_dead_peer_below_inbox_cap_is_unaffected() -> TestResult<()> {
-        use std::time::Instant;
-
         let (live_ids, routers, address_lookup) = echo_servers(1).await?;
         let live_peer = live_ids[0];
 
@@ -1203,6 +1292,337 @@ mod tests {
         let conn = pool.get_or_connect(ids[0]).await?;
         let cid2 = conn.stable_id();
         assert_ne!(cid1, cid2);
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
+
+    /// In-flight attempts do not count towards [`Options::max_connections`].
+    ///
+    /// Otherwise peers we are still trying to reach take every slot, and
+    /// unrelated peers fail with `TooManyConnections` until `connect_timeout`
+    /// expires.
+    #[tokio::test]
+    async fn inflight_connects_do_not_exhaust_slots() -> TestResult<()> {
+        let (live_ids, routers, address_lookup) = echo_servers(1).await?;
+        let live_peer = live_ids[0];
+
+        let max_connections = 2;
+        let mut dead = Vec::new();
+        let mut _socks = Vec::new();
+        for i in 0..max_connections {
+            let (sock, addr) = dead_addr()?;
+            _socks.push(sock);
+            let id = SecretKey::from_bytes(&[20 + i as u8; 32]).public();
+            address_lookup.add_endpoint_info(EndpointAddr {
+                id,
+                addrs: vec![addr].into_iter().collect(),
+            });
+            dead.push(id);
+        }
+
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let pool = ConnectionPool::new(
+            endpoint.clone(),
+            ECHO_ALPN,
+            Options {
+                connect_timeout: Duration::from_secs(5),
+                max_connections,
+                ..test_options()
+            },
+        );
+
+        // Park the pool at its connection limit with attempts that neither
+        // succeed nor fail until connect_timeout expires.
+        let mut parked = Vec::new();
+        for id in dead {
+            let pool = pool.clone();
+            parked.push(n0_future::task::spawn(async move {
+                pool.get_or_connect(id).await
+            }));
+        }
+        n0_future::time::sleep(Duration::from_millis(100)).await;
+
+        let res = pool.get_or_connect(live_peer).await;
+        assert!(
+            res.is_ok(),
+            "unrelated peer rejected while pool holds no connections: {res:?}"
+        );
+        drop(res);
+
+        // Let the parked attempts finish before tearing the endpoint down.
+        for p in parked {
+            let _ = p.await;
+        }
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
+
+    /// A connection made after the pool filled up fails with `TooManyConnections`.
+    ///
+    /// Attempts no longer reserve a slot, so without a second check the pool
+    /// would go over `max_connections`.
+    #[tokio::test]
+    async fn connect_into_a_full_pool_fails() -> TestResult<()> {
+        let (ids, routers, address_lookup) = echo_servers(2).await?;
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let pool = ConnectionPool::new(
+            endpoint.clone(),
+            ECHO_ALPN,
+            Options {
+                max_connections: 1,
+                ..test_options()
+            },
+        );
+        // Both attempts start before either connection exists.
+        let (a, b) = tokio::join!(pool.get_or_connect(ids[0]), pool.get_or_connect(ids[1]));
+        let full = |res: &Result<_, PoolConnectError>| {
+            matches!(res, Err(PoolConnectError::TooManyConnections { .. }))
+        };
+        assert!(
+            (a.is_ok() && full(&b)) || (full(&a) && b.is_ok()),
+            "expected one connection and one TooManyConnections: {a:?}, {b:?}"
+        );
+        drop((a, b));
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
+
+    /// A stale close event leaves the current connection alone.
+    ///
+    /// The event is for a connection the peer no longer has. The pool closes a
+    /// connection before it replaces it, and polls close events before its
+    /// inbox, so this cannot happen through the public API yet. The test calls
+    /// the handler directly.
+    #[tokio::test]
+    async fn stale_close_event_keeps_the_current_connection() -> TestResult<()> {
+        let (ids, routers, address_lookup) = echo_servers(1).await?;
+        let id = ids[0];
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let conn = endpoint.connect(id, ECHO_ALPN).await?;
+        let (mut actor, _tx) = Actor::new(endpoint.clone(), ECHO_ALPN, test_options());
+        let counter = ConnectionCounter::new(id, 1, actor.unused_tx.clone());
+        actor.peers.insert(
+            id,
+            PeerState::Ready {
+                generation: 1,
+                connection: conn.clone(),
+                counter,
+                unused_since: None,
+            },
+        );
+
+        actor.handle_conn_closed(id, 0);
+        assert!(
+            actor.peers.contains_key(&id),
+            "a stale close event removed the peer"
+        );
+        assert!(
+            conn.close_reason().is_none(),
+            "a stale close event closed the connection"
+        );
+        actor.handle_conn_closed(id, 1);
+        assert!(!actor.peers.contains_key(&id));
+
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
+
+    /// A connection that has closed is not handed out.
+    ///
+    /// The pool learns of a close through a watcher, so a connection can be
+    /// closed while it is still the peer's current one. A request that lands in
+    /// that window gets a new connection.
+    #[tokio::test]
+    async fn closed_connection_is_not_handed_out() -> TestResult<()> {
+        let (ids, routers, address_lookup) = echo_servers(1).await?;
+        let id = ids[0];
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let conn = endpoint.connect(id, ECHO_ALPN).await?;
+        let (mut actor, _tx) = Actor::new(endpoint.clone(), ECHO_ALPN, test_options());
+        let counter = ConnectionCounter::new(id, 1, actor.unused_tx.clone());
+        actor.peers.insert(
+            id,
+            PeerState::Ready {
+                generation: 1,
+                connection: conn.clone(),
+                counter,
+                unused_since: None,
+            },
+        );
+        // The pool has not handled the close event yet.
+        conn.close(0u32.into(), b"gone");
+        conn.closed().await;
+
+        let (tx, mut rx) = oneshot::channel();
+        actor.handle_request(RequestRef { id, tx });
+        assert!(
+            rx.try_recv().is_err(),
+            "the closed connection was handed out"
+        );
+        assert!(
+            matches!(actor.peers.get(&id), Some(PeerState::Connecting { .. })),
+            "the request did not start a new connection"
+        );
+
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
+
+    /// A connection whose `on_connected` failed is closed.
+    ///
+    /// Dropping it would not be enough: the callback may keep a handle to it.
+    #[tokio::test]
+    async fn on_connected_error_closes_the_connection() -> TestResult<()> {
+        let (ids, routers, address_lookup) = echo_servers(1).await?;
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let kept = Arc::new(std::sync::Mutex::new(None));
+        let pool = ConnectionPool::new(
+            endpoint.clone(),
+            ECHO_ALPN,
+            test_options().with_on_connected({
+                let kept = kept.clone();
+                move |_, conn: Connection| {
+                    *kept.lock().expect("poisoned") = Some(conn);
+                    async { Err(io::Error::other("on_connect failed")) }
+                }
+            }),
+        );
+        let res = pool.get_or_connect(ids[0]).await;
+        assert!(matches!(res, Err(PoolConnectError::OnConnectError { .. })));
+        let conn = kept
+            .lock()
+            .expect("poisoned")
+            .take()
+            .expect("callback not called");
+        assert!(
+            conn.close_reason().is_some(),
+            "the connection stayed open after on_connected failed"
+        );
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
+
+    /// Using a connection again restarts its idle timeout.
+    ///
+    /// The connection is closed `idle_timeout` after it last went unused, not
+    /// after it first did.
+    #[tokio::test]
+    async fn use_restarts_the_idle_timeout() -> TestResult<()> {
+        let (ids, routers, address_lookup) = echo_servers(1).await?;
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let idle_timeout = Duration::from_millis(500);
+        let kept = Arc::new(std::sync::Mutex::new(None));
+        let pool = ConnectionPool::new(
+            endpoint.clone(),
+            ECHO_ALPN,
+            Options {
+                idle_timeout,
+                ..test_options()
+            }
+            .with_on_connected({
+                let kept = kept.clone();
+                move |_, conn: Connection| {
+                    *kept.lock().expect("poisoned") = Some(conn);
+                    async { Ok(()) }
+                }
+            }),
+        );
+        drop(pool.get_or_connect(ids[0]).await?);
+        let conn = kept
+            .lock()
+            .expect("poisoned")
+            .take()
+            .expect("callback not called");
+
+        n0_future::time::sleep(idle_timeout * 3 / 5).await;
+        drop(pool.get_or_connect(ids[0]).await?);
+        // Past the first timeout, within the second.
+        n0_future::time::sleep(idle_timeout * 3 / 5).await;
+        assert!(
+            conn.close_reason().is_none(),
+            "closed before its restarted timeout"
+        );
+        // Past the second.
+        n0_future::time::sleep(idle_timeout * 4 / 5).await;
+        assert!(
+            conn.close_reason().is_some(),
+            "not closed after its timeout"
+        );
+
+        shutdown_routers(routers).await;
+        endpoint.close().await;
+        Ok(())
+    }
+
+    /// A stale unused event leaves the current connection's idle time alone.
+    ///
+    /// The event is for a connection the peer no longer has. References to a
+    /// replaced connection can outlive it, and when the last one drops, its
+    /// event names the peer, whose current connection is another.
+    #[tokio::test]
+    async fn stale_unused_event_keeps_the_idle_time() -> TestResult<()> {
+        let (ids, routers, address_lookup) = echo_servers(1).await?;
+        let id = ids[0];
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Default)
+            .address_lookup(address_lookup)
+            .bind()
+            .await?;
+        let conn = endpoint.connect(id, ECHO_ALPN).await?;
+        let (mut actor, _tx) = Actor::new(endpoint.clone(), ECHO_ALPN, test_options());
+        let counter = ConnectionCounter::new(id, 1, actor.unused_tx.clone());
+        let since = n0_future::time::Instant::now();
+        actor.unused.insert((since, id));
+        actor.peers.insert(
+            id,
+            PeerState::Ready {
+                generation: 1,
+                connection: conn,
+                counter,
+                unused_since: Some(since),
+            },
+        );
+
+        actor.handle_unused_event(id, 0);
+        assert!(
+            matches!(
+                actor.peers.get(&id),
+                Some(PeerState::Ready { unused_since: Some(s), .. }) if *s == since
+            ),
+            "a stale unused event restarted the idle timeout"
+        );
+        assert_eq!(actor.unused.first(), Some(&(since, id)));
+
         shutdown_routers(routers).await;
         endpoint.close().await;
         Ok(())
