@@ -327,26 +327,26 @@ struct Idle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseReason {
     /// Nothing used it for [`Options::idle_timeout`], or it was evicted.
-    Idle = 0,
+    Idle,
     /// The pool let go of it while it was still in use.
     ///
     /// [`ConnectionPool::close`] and the pool shutting down do this, and so
     /// does the cap on superseded connections.
-    Dropped = 1,
+    Dropped,
     /// A newer connection to the peer took its place.
-    Discarded = 2,
+    Discarded,
     /// The pool was full when the attempt that made it finished.
-    TooManyConnections = 3,
+    TooManyConnections,
     /// [`Options::on_connected`] failed for it, or ran out of time.
-    OnConnectedFailed = 4,
+    OnConnectedFailed,
     /// The peer was closed while the attempt that made it was running.
-    Closed = 5,
+    Closed,
 }
 
 impl CloseReason {
     /// Returns the error code the pool closes with.
     fn code(self) -> VarInt {
-        VarInt::from_u32(self as u32)
+        VarInt::from_u32(0)
     }
 
     /// Returns the reason the pool closes with, which the peer can read.
