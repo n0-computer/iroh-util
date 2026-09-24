@@ -13,7 +13,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
-    io,
+    fmt, io,
     ops::Deref,
     sync::{
         Arc,
@@ -174,38 +174,117 @@ struct RequestRef {
     tx: oneshot::Sender<Result<ConnectionRef, PoolConnectError>>,
 }
 
+/// Which attempt to a peer made a connection.
+///
+/// Connections to a peer come and go, and an event about one can arrive after
+/// the pool has moved on. The generation tells them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Generation(u64);
+
+impl Generation {
+    /// Returns the generation, and moves `self` on to the next one.
+    fn next(&mut self) -> Self {
+        let current = *self;
+        self.0 += 1;
+        current
+    }
+}
+
+/// Identifies one connection: the peer, and the attempt that made it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct ConnId {
+    peer: EndpointId,
+    generation: Generation,
+}
+
+impl fmt::Display for ConnId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}#{}", self.peer.fmt_short(), self.generation.0)
+    }
+}
+
 /// State for a peer in the connection pool
 enum PeerState {
     /// We are currently connecting to this peer.
     Connecting {
-        generation: u64,
+        generation: Generation,
         /// Waiters that need to be notified when the connection is established or fails.
         waiters: Vec<oneshot::Sender<Result<ConnectionRef, PoolConnectError>>>,
     },
     /// We have a connection to the peer.
     Ready {
         /// The generation of the attempt that made the connection.
-        generation: u64,
+        generation: Generation,
         connection: Connection,
         counter: ConnectionCounter,
-        unused_since: Option<Instant>,
     },
 }
 
-type ConnectResult = (EndpointId, u64, Result<Connection, PoolConnectError>);
+/// The connections nothing uses, in the order they went unused.
+///
+/// The pool closes a connection once it has been unused for
+/// [`Options::idle_timeout`], and evicts the one that has been unused longest
+/// to make room. Entries are keyed both ways, so a connection's entry can be
+/// found and removed without a scan.
+#[derive(Debug, Default)]
+struct UnusedSet {
+    since: HashMap<ConnId, Instant>,
+    order: BTreeSet<(Instant, ConnId)>,
+}
+
+impl UnusedSet {
+    /// Records that the connection went unused at `now`.
+    fn insert(&mut self, conn_id: ConnId, now: Instant) {
+        self.remove(conn_id);
+        self.since.insert(conn_id, now);
+        self.order.insert((now, conn_id));
+    }
+
+    /// Removes the connection's entry, if it has one.
+    fn remove(&mut self, conn_id: ConnId) {
+        if let Some(since) = self.since.remove(&conn_id) {
+            self.order.remove(&(since, conn_id));
+        }
+    }
+
+    /// Returns when the connection that has been unused longest went unused.
+    fn oldest(&self) -> Option<Instant> {
+        self.order.first().map(|(since, _)| *since)
+    }
+
+    /// Removes and returns the connection that has been unused longest.
+    fn pop_oldest(&mut self) -> Option<ConnId> {
+        let (_, conn_id) = self.order.pop_first()?;
+        self.since.remove(&conn_id);
+        Some(conn_id)
+    }
+
+    /// Removes and returns a connection that has been unused for `timeout`.
+    fn pop_expired(&mut self, now: Instant, timeout: Duration) -> Option<ConnId> {
+        let (since, conn_id) = *self.order.first()?;
+        if since + timeout > now {
+            return None;
+        }
+        self.order.pop_first();
+        self.since.remove(&conn_id);
+        Some(conn_id)
+    }
+}
+
+type ConnectResult = (ConnId, Result<Connection, PoolConnectError>);
 
 struct Actor {
     /// Inbox
     rx: mpsc::Receiver<ActorMessage>,
     /// Separate inbox for unused events, gets processed before the main inbox.
     ///
-    /// Each event names the peer and the generation of the connection.
-    unused_rx: mpsc::UnboundedReceiver<(EndpointId, u64)>,
+    /// Each event names the connection that has no references left.
+    unused_rx: mpsc::UnboundedReceiver<ConnId>,
     /// Sender for the unused inbox to be cloned into the connection counter.
     ///
     /// This is unbounded so it can be used in Drop, but it is bounded by the number
     /// of ConnectionRefs we give out, which is bounded by max_connections.
-    unused_tx: mpsc::UnboundedSender<(EndpointId, u64)>,
+    unused_tx: mpsc::UnboundedSender<ConnId>,
     options: Options,
     endpoint: Endpoint,
     alpn: Arc<[u8]>,
@@ -213,17 +292,11 @@ struct Actor {
     /// Futures for currently connecting peers.
     connecting: FuturesUnordered<Boxed<ConnectResult>>,
     /// Generation counter used to distinguish between connection attempts to the same peer.
-    next_generation: u64,
-    /// Futures for connection close watchers.
-    ///
-    /// Each yields the peer and the generation of the connection it watches.
-    conn_close: FuturesUnordered<Boxed<(EndpointId, u64)>>,
+    next_generation: Generation,
+    /// Futures for connection close watchers, each yielding which connection closed.
+    conn_close: FuturesUnordered<Boxed<ConnId>>,
     /// Currently unused connections, in order of when they became unused.
-    ///
-    /// Keyed by each peer's `unused_since`, so a peer's entry can be found and
-    /// removed without a scan. The first entry is the next connection to close
-    /// for being unused.
-    unused: BTreeSet<(Instant, EndpointId)>,
+    unused: UnusedSet,
 }
 
 impl Actor {
@@ -244,9 +317,9 @@ impl Actor {
                 alpn: alpn.to_vec().into(),
                 peers: HashMap::new(),
                 connecting: FuturesUnordered::new(),
-                next_generation: 0,
+                next_generation: Generation(0),
                 conn_close: FuturesUnordered::new(),
-                unused: BTreeSet::new(),
+                unused: UnusedSet::default(),
             },
             tx,
         )
@@ -256,10 +329,10 @@ impl Actor {
         // We bias processing internal events before accepting more work from
         // the external mailbox.
         loop {
-            let next_unused_timer_at = match self.unused.first() {
+            let next_unused_timer_at = match self.unused.oldest() {
                 None => MaybeFuture::None,
-                Some((unused_since, _endpoint_id)) => {
-                    let deadline = *unused_since + self.options.idle_timeout;
+                Some(unused_since) => {
+                    let deadline = unused_since + self.options.idle_timeout;
                     MaybeFuture::Some(n0_future::time::sleep_until(deadline))
                 }
             };
@@ -267,16 +340,16 @@ impl Actor {
                 biased;
 
                 // Handle unused events first, since this might give us some room.
-                Some((id, generation)) = self.unused_rx.recv() => {
-                    self.handle_unused_event(id, generation);
+                Some(conn_id) = self.unused_rx.recv() => {
+                    self.handle_unused_event(conn_id);
                 }
 
-                Some((id, generation, result)) = self.connecting.next(), if !self.connecting.is_empty() => {
-                    self.handle_connect_result(id, generation, result);
+                Some((conn_id, result)) = self.connecting.next(), if !self.connecting.is_empty() => {
+                    self.handle_connect_result(conn_id, result);
                 }
 
-                Some((id, generation)) = self.conn_close.next(), if !self.conn_close.is_empty() => {
-                    self.handle_conn_closed(id, generation);
+                Some(conn_id) = self.conn_close.next(), if !self.conn_close.is_empty() => {
+                    self.handle_conn_closed(conn_id);
                 }
 
                 _ = next_unused_timer_at => self.close_unused(),
@@ -340,14 +413,14 @@ impl Actor {
                     return;
                 }
                 PeerState::Ready {
+                    generation,
                     connection,
                     counter,
-                    unused_since,
-                    ..
                 } => {
-                    if let Some(since) = unused_since.take() {
-                        self.unused.remove(&(since, id));
-                    }
+                    self.unused.remove(ConnId {
+                        peer: id,
+                        generation: *generation,
+                    });
                     let one = counter.get_one();
                     info!(%id, "Handing out ConnectionRef {}", counter.current());
                     let _ = req.tx.send(Ok(ConnectionRef::new(connection.clone(), one)));
@@ -361,17 +434,18 @@ impl Actor {
             return;
         }
 
-        let generation = self.next_generation;
-        self.next_generation += 1;
+        let conn_id = ConnId {
+            peer: id,
+            generation: self.next_generation.next(),
+        };
         self.peers.insert(
             id,
             PeerState::Connecting {
-                generation,
+                generation: conn_id.generation,
                 waiters: vec![req.tx],
             },
         );
-        self.connecting
-            .push(self.make_connect_future(id, generation));
+        self.connecting.push(self.make_connect_future(conn_id));
     }
 
     /// Makes room for one more connection if the pool holds `max_connections`.
@@ -387,23 +461,23 @@ impl Actor {
         if connections < self.options.max_connections {
             return true;
         }
-        let Some((since, id)) = self.unused.pop_first() else {
+        let Some(conn_id) = self.unused.pop_oldest() else {
             return false;
         };
         debug_assert!(
             matches!(
-                self.peers.get(&id),
-                Some(PeerState::Ready { counter, unused_since: Some(s), .. })
-                    if *s == since && counter.is_unused()
+                self.peers.get(&conn_id.peer),
+                Some(PeerState::Ready { generation, counter, .. })
+                    if *generation == conn_id.generation && counter.is_unused()
             ),
-            "the unused list names a peer that is not unused"
+            "the unused list names a connection that is not unused"
         );
-        trace!("evicting oldest unused peer {id} to make room");
-        self.remove_peer(id);
+        trace!(%conn_id, "evicting oldest unused peer to make room");
+        self.remove_peer(conn_id.peer);
         true
     }
 
-    fn make_connect_future(&self, id: EndpointId, generation: u64) -> Boxed<ConnectResult> {
+    fn make_connect_future(&self, conn_id: ConnId) -> Boxed<ConnectResult> {
         let endpoint = self.endpoint.clone();
         let alpn = self.alpn.clone();
         let on_connected = self.options.on_connected.clone();
@@ -412,7 +486,7 @@ impl Actor {
             let mut connected = None;
             let attempt = async {
                 let conn = endpoint
-                    .connect(id, &alpn[..])
+                    .connect(conn_id.peer, &alpn[..])
                     .await
                     .map_err(PoolConnectError::from)?;
                 connected = Some(conn.clone());
@@ -432,16 +506,19 @@ impl Actor {
             {
                 conn.close(0u32.into(), b"on_connected failed");
             }
-            (id, generation, result)
+            (conn_id, result)
         })
     }
 
     fn handle_connect_result(
         &mut self,
-        id: EndpointId,
-        generation: u64,
+        conn_id: ConnId,
         result: Result<Connection, PoolConnectError>,
     ) {
+        let ConnId {
+            peer: id,
+            generation,
+        } = conn_id;
         let current = matches!(
             self.peers.get(&id),
             Some(PeerState::Connecting { generation: g, .. }) if *g == generation
@@ -467,7 +544,7 @@ impl Actor {
                 }
             }
             Ok(conn) => {
-                let counter = ConnectionCounter::new(id, generation, self.unused_tx.clone());
+                let counter = ConnectionCounter::new(conn_id, self.unused_tx.clone());
                 for tx in waiters {
                     if tx.is_closed() {
                         continue;
@@ -483,18 +560,17 @@ impl Actor {
                 info!(%id, "connected, {} ref(s) outstanding", counter.current());
 
                 // Create a future that waits for the connection to close.
-                let close_fut: Boxed<(EndpointId, u64)> = {
+                let close_fut: Boxed<ConnId> = {
                     let conn = conn.clone();
                     Box::pin(async move {
                         conn.closed().await;
-                        (id, generation)
+                        conn_id
                     })
                 };
                 self.conn_close.push(close_fut);
 
-                let unused_since = counter.is_unused().then(Instant::now);
-                if let Some(since) = unused_since {
-                    self.unused.insert((since, id));
+                if counter.is_unused() {
+                    self.unused.insert(conn_id, Instant::now());
                 }
                 self.peers.insert(
                     id,
@@ -502,7 +578,6 @@ impl Actor {
                         generation,
                         connection: conn,
                         counter,
-                        unused_since,
                     },
                 );
             }
@@ -519,14 +594,14 @@ impl Actor {
     ///
     /// Only acts if the connection is still the peer's current one. One the
     /// pool replaced has closed already, and must not take down its successor.
-    fn handle_conn_closed(&mut self, id: EndpointId, generation: u64) {
+    fn handle_conn_closed(&mut self, conn_id: ConnId) {
         let current = matches!(
-            self.peers.get(&id),
-            Some(PeerState::Ready { generation: g, .. }) if *g == generation
+            self.peers.get(&conn_id.peer),
+            Some(PeerState::Ready { generation, .. }) if *generation == conn_id.generation
         );
         if current {
-            trace!(%id, "connection closed");
-            self.remove_peer(id);
+            trace!(%conn_id, "connection closed");
+            self.remove_peer(conn_id.peer);
         }
     }
 
@@ -535,40 +610,32 @@ impl Actor {
     /// Only acts if the connection is still the peer's current one. References
     /// to a connection the pool replaced can outlive it, and their last drop
     /// must not restart its successor's idle timeout.
-    fn handle_unused_event(&mut self, id: EndpointId, generation: u64) {
+    fn handle_unused_event(&mut self, conn_id: ConnId) {
         let Some(PeerState::Ready {
-            generation: g,
+            generation,
             counter,
-            unused_since,
             ..
-        }) = self.peers.get_mut(&id)
+        }) = self.peers.get(&conn_id.peer)
         else {
             return;
         };
-        if *g != generation {
+        if *generation != conn_id.generation {
             return;
         }
         // Connection was handed out in the meantime.
         if !counter.is_unused() {
             return;
         }
-        let now = Instant::now();
-        if let Some(since) = unused_since.replace(now) {
-            self.unused.remove(&(since, id));
-        }
-        self.unused.insert((now, id));
-        trace!(%id, "peer unused");
+        self.unused.insert(conn_id, Instant::now());
+        trace!(%conn_id, "peer unused");
     }
 
     /// Closes the connections that have been unused for the idle timeout.
     fn close_unused(&mut self) {
         let now = Instant::now();
-        while let Some(&(since, id)) = self.unused.first()
-            && since + self.options.idle_timeout <= now
-        {
-            trace!(%id, "unused timeout, removing");
-            self.unused.pop_first();
-            self.remove_peer(id);
+        while let Some(conn_id) = self.unused.pop_expired(now, self.options.idle_timeout) {
+            trace!(%conn_id, "unused timeout, removing");
+            self.remove_peer(conn_id.peer);
         }
     }
 
@@ -581,10 +648,9 @@ impl Actor {
                     }
                 }
                 PeerState::Ready {
+                    generation,
                     connection,
                     counter,
-                    unused_since,
-                    ..
                 } => {
                     let reason: &[u8] = if counter.is_unused() {
                         b"unused"
@@ -592,9 +658,10 @@ impl Actor {
                         b"drop"
                     };
                     connection.close(0u32.into(), reason);
-                    if let Some(since) = unused_since {
-                        self.unused.remove(&(since, id));
-                    }
+                    self.unused.remove(ConnId {
+                        peer: id,
+                        generation,
+                    });
                 }
             }
         }
@@ -646,10 +713,9 @@ impl ConnectionPool {
 #[derive(Debug)]
 struct ConnectionCounterInner {
     count: AtomicUsize,
-    id: EndpointId,
-    /// The generation of the connection, which unused events name.
-    generation: u64,
-    unused_tx: mpsc::UnboundedSender<(EndpointId, u64)>,
+    /// Which connection this counts, which its unused events name.
+    conn_id: ConnId,
+    unused_tx: mpsc::UnboundedSender<ConnId>,
 }
 
 #[derive(Debug, Clone)]
@@ -658,16 +724,11 @@ struct ConnectionCounter {
 }
 
 impl ConnectionCounter {
-    fn new(
-        id: EndpointId,
-        generation: u64,
-        unused_tx: mpsc::UnboundedSender<(EndpointId, u64)>,
-    ) -> Self {
+    fn new(conn_id: ConnId, unused_tx: mpsc::UnboundedSender<ConnId>) -> Self {
         Self {
             inner: Arc::new(ConnectionCounterInner {
                 count: AtomicUsize::new(0),
-                id,
-                generation,
+                conn_id,
                 unused_tx,
             }),
         }
@@ -699,10 +760,7 @@ impl Drop for OneConnection {
     fn drop(&mut self) {
         if self.inner.count.fetch_sub(1, Ordering::SeqCst) == 1 {
             // Send an unused event to the actor.
-            let _ = self
-                .inner
-                .unused_tx
-                .send((self.inner.id, self.inner.generation));
+            let _ = self.inner.unused_tx.send(self.inner.conn_id);
         }
     }
 }
@@ -731,9 +789,42 @@ mod tests {
     use tracing::trace;
 
     use super::{
-        Actor, ConnectionCounter, ConnectionPool, OnConnected, Options, PeerState,
-        PoolConnectError, RequestRef,
+        Actor, ConnId, ConnectionCounter, ConnectionPool, Generation, OnConnected, Options,
+        PeerState, PoolConnectError, RequestRef,
     };
+
+    /// Puts `conn` into `actor` as its peer's current connection.
+    ///
+    /// Returns which connection it is, for the events a test hands the actor.
+    fn insert_ready(actor: &mut Actor, conn: &Connection) -> ConnId {
+        let conn_id = ConnId {
+            peer: conn.remote_id(),
+            generation: Generation(1),
+        };
+        let counter = ConnectionCounter::new(conn_id, actor.unused_tx.clone());
+        if counter.is_unused() {
+            actor
+                .unused
+                .insert(conn_id, n0_future::time::Instant::now());
+        }
+        actor.peers.insert(
+            conn_id.peer,
+            PeerState::Ready {
+                generation: conn_id.generation,
+                connection: conn.clone(),
+                counter,
+            },
+        );
+        conn_id
+    }
+
+    /// Returns the id of a connection to `peer` that the pool never made.
+    fn stale_conn_id(peer: EndpointId) -> ConnId {
+        ConnId {
+            peer,
+            generation: Generation(0),
+        }
+    }
 
     const ECHO_ALPN: &[u8] = b"echo";
 
@@ -1415,18 +1506,9 @@ mod tests {
             .await?;
         let conn = endpoint.connect(id, ECHO_ALPN).await?;
         let (mut actor, _tx) = Actor::new(endpoint.clone(), ECHO_ALPN, test_options());
-        let counter = ConnectionCounter::new(id, 1, actor.unused_tx.clone());
-        actor.peers.insert(
-            id,
-            PeerState::Ready {
-                generation: 1,
-                connection: conn.clone(),
-                counter,
-                unused_since: None,
-            },
-        );
+        let conn_id = insert_ready(&mut actor, &conn);
 
-        actor.handle_conn_closed(id, 0);
+        actor.handle_conn_closed(stale_conn_id(id));
         assert!(
             actor.peers.contains_key(&id),
             "a stale close event removed the peer"
@@ -1435,7 +1517,7 @@ mod tests {
             conn.close_reason().is_none(),
             "a stale close event closed the connection"
         );
-        actor.handle_conn_closed(id, 1);
+        actor.handle_conn_closed(conn_id);
         assert!(!actor.peers.contains_key(&id));
 
         shutdown_routers(routers).await;
@@ -1459,16 +1541,7 @@ mod tests {
             .await?;
         let conn = endpoint.connect(id, ECHO_ALPN).await?;
         let (mut actor, _tx) = Actor::new(endpoint.clone(), ECHO_ALPN, test_options());
-        let counter = ConnectionCounter::new(id, 1, actor.unused_tx.clone());
-        actor.peers.insert(
-            id,
-            PeerState::Ready {
-                generation: 1,
-                connection: conn.clone(),
-                counter,
-                unused_since: None,
-            },
-        );
+        insert_ready(&mut actor, &conn);
         // The pool has not handled the close event yet.
         conn.close(0u32.into(), b"gone");
         conn.closed().await;
@@ -1600,28 +1673,20 @@ mod tests {
             .await?;
         let conn = endpoint.connect(id, ECHO_ALPN).await?;
         let (mut actor, _tx) = Actor::new(endpoint.clone(), ECHO_ALPN, test_options());
-        let counter = ConnectionCounter::new(id, 1, actor.unused_tx.clone());
-        let since = n0_future::time::Instant::now();
-        actor.unused.insert((since, id));
-        actor.peers.insert(
-            id,
-            PeerState::Ready {
-                generation: 1,
-                connection: conn,
-                counter,
-                unused_since: Some(since),
-            },
-        );
+        let conn_id = insert_ready(&mut actor, &conn);
+        let since = actor.unused.oldest().expect("the connection is unused");
 
-        actor.handle_unused_event(id, 0);
-        assert!(
-            matches!(
-                actor.peers.get(&id),
-                Some(PeerState::Ready { unused_since: Some(s), .. }) if *s == since
-            ),
+        actor.handle_unused_event(stale_conn_id(id));
+        assert_eq!(
+            actor.unused.oldest(),
+            Some(since),
             "a stale unused event restarted the idle timeout"
         );
-        assert_eq!(actor.unused.first(), Some(&(since, id)));
+        actor.handle_unused_event(conn_id);
+        assert!(
+            actor.unused.oldest().expect("still unused") >= since,
+            "the connection's own event was ignored"
+        );
 
         shutdown_routers(routers).await;
         endpoint.close().await;
