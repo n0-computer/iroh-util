@@ -2309,6 +2309,7 @@ mod tests {
             conn.close_reason().is_some(),
             "the connection stayed open after on_connected failed"
         );
+        assert!(conn.upgrade().is_none(), "upgraded a rejected connection");
         shutdown_routers(routers).await;
         endpoint.close().await;
         Ok(())
@@ -2395,9 +2396,11 @@ mod tests {
             Some(since),
             "a stale unused event restarted the idle timeout"
         );
+        // Taken off the list as if handed out, its own event lists it again.
+        actor.unused.remove(conn_id);
         actor.handle_unused_event(conn_id);
         assert!(
-            actor.unused.oldest().expect("still unused") >= since,
+            actor.unused.oldest().is_some(),
             "the connection's own event was ignored"
         );
 
@@ -3293,6 +3296,104 @@ mod tests {
         // `close` returns once the request is queued; wait for the pool to act.
         tokio::time::timeout(SHORT_IDLE * 5, conn_ref.closed()).await?;
         assert!(weak.upgrade().is_none(), "upgraded a closed connection");
+        server.close().await;
+        Ok(())
+    }
+
+    /// Upgrading fails once the pool has seen the remote close the connection.
+    #[tokio::test]
+    async fn upgrade_after_a_remote_close_fails() -> TestResult<()> {
+        let server = incoming_server().await?;
+        let client = iroh::Endpoint::bind(presets::Minimal).await?;
+        let pool = ConnectionPool::new(server.clone(), INCOMING_ALPN, short_idle_options());
+        let (outgoing, conn_ref) = Superseded::connect(&client, &server, &pool).await?;
+        let weak = conn_ref.downgrade();
+        drop(conn_ref);
+
+        outgoing.close(0u32.into(), b"gone");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while weak.upgrade().is_some() {
+                n0_future::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "upgrades kept succeeding after the remote closed")?;
+        server.close().await;
+        Ok(())
+    }
+
+    /// Dropping the last pool handle closes every connection it holds.
+    ///
+    /// A connection in use closes as `drop`, and its weak references no longer
+    /// upgrade.
+    #[tokio::test]
+    async fn dropping_the_pool_closes_its_connections() -> TestResult<()> {
+        let server = incoming_server().await?;
+        let client = iroh::Endpoint::bind(presets::Minimal).await?;
+        let pool = ConnectionPool::new(server.clone(), INCOMING_ALPN, short_idle_options());
+        let (outgoing, conn_ref) = Superseded::connect(&client, &server, &pool).await?;
+        let weak = conn_ref.downgrade();
+
+        drop(pool);
+        let err = tokio::time::timeout(SHORT_IDLE * 5, outgoing.closed()).await?;
+        assert_closed_as(&err, CloseReason::Dropped);
+        assert!(
+            weak.upgrade().is_none(),
+            "upgraded after the pool shut down"
+        );
+        drop(conn_ref);
+        server.close().await;
+        Ok(())
+    }
+
+    /// An adoption that `on_connected` rejects leaves the current connection.
+    ///
+    /// The rejected connection is closed as `rejected`, and a weak reference
+    /// the callback kept does not upgrade.
+    #[tokio::test]
+    async fn a_rejected_adoption_keeps_the_current_connection() -> TestResult<()> {
+        let kept = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let options = short_idle_options().with_on_connected({
+            let kept = kept.clone();
+            move |_ep, conn: ConnectionRef| {
+                let mut kept = kept.lock().expect("poisoned");
+                kept.push(conn.downgrade());
+                // Accept the first connection, reject the ones after it.
+                let accept = kept.len() == 1;
+                async move {
+                    if accept {
+                        Ok(())
+                    } else {
+                        Err(io::Error::other("rejected"))
+                    }
+                }
+            }
+        });
+        let server = incoming_server().await?;
+        let client = iroh::Endpoint::bind(presets::Minimal).await?;
+        let pool = ConnectionPool::new(server.clone(), INCOMING_ALPN, options);
+        let (_first, first_ref) = Superseded::connect(&client, &server, &pool).await?;
+
+        let (outgoing, incoming) = connect_pair(&client, &server).await?;
+        let adopted = pool.handle_connection(incoming).await;
+        assert!(
+            matches!(adopted, Err(PoolConnectError::OnConnectError { .. })),
+            "adopted a rejected connection: {adopted:?}"
+        );
+        let err = tokio::time::timeout(SHORT_IDLE * 5, outgoing.closed()).await?;
+        assert_closed_as(&err, CloseReason::Rejected);
+        let rejected = kept.lock().expect("poisoned").pop().expect("not called");
+        assert!(
+            rejected.upgrade().is_none(),
+            "upgraded a rejected connection"
+        );
+
+        assert!(
+            !first_ref.is_superseded(),
+            "superseded by a rejected connection"
+        );
+        let current = pool.get_or_connect(client.id()).await?;
+        assert_eq!(current.stable_id(), first_ref.stable_id());
         server.close().await;
         Ok(())
     }
