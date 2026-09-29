@@ -867,6 +867,17 @@ impl Actor {
             .sum()
     }
 
+    /// Returns whether adding a connection to the peer grows the pool.
+    ///
+    /// It does not when the peer has a current connection and its superseded
+    /// ones are at [`Options::max_superseded_per_peer`]. One of them becomes
+    /// superseded, and the cap closes the oldest.
+    fn adding_grows(&self, id: EndpointId) -> bool {
+        self.peers.get(&id).is_none_or(|peer| {
+            peer.ready().is_none() || peer.superseded.len() < self.options.max_superseded_per_peer
+        })
+    }
+
     /// Makes room for one more connection if the pool holds `max_connections`.
     ///
     /// Evicts the connection that has been unused the longest, and returns
@@ -987,9 +998,10 @@ impl Actor {
         } = attempt;
         let conn = PooledConnection::new(connection, counter);
         // Connections made since this attempt started may have filled the pool. A
-        // connection this one supersedes stays open, so every attempt that
-        // finishes adds one to the connections the pool holds.
-        if !self.make_room() {
+        // connection this one supersedes stays open, so an attempt that
+        // finishes adds one to the connections the pool holds, unless that
+        // pushes the peer's superseded connections over the cap.
+        if self.adding_grows(conn_id.peer) && !self.make_room() {
             debug!(%conn_id, "connected, but the pool is full");
             conn.close_as(CloseReason::TooManyConnections);
             fail_waiters(waiters, &e!(PoolConnectError::TooManyConnections));
@@ -2764,6 +2776,37 @@ mod tests {
         assert!(
             connections[2].close_reason().is_none(),
             "closed the current connection"
+        );
+        server.close().await;
+        Ok(())
+    }
+
+    /// A full pool adopts a connection that does not make it hold more.
+    ///
+    /// When the peer's superseded connections are at the cap, the adoption
+    /// supersedes the current one, and the cap closes the oldest.
+    #[tokio::test]
+    async fn adopting_at_the_superseded_cap_fits_a_full_pool() -> TestResult<()> {
+        let options = Options {
+            max_connections: 2,
+            max_superseded_per_peer: 1,
+            ..short_idle_options()
+        };
+        let server = incoming_server().await?;
+        let client = iroh::Endpoint::bind(presets::Minimal).await?;
+        let pool = ConnectionPool::new(server.clone(), INCOMING_ALPN, options);
+        // Two connections in use, one current and one superseded: the pool is
+        // full, and the peer is at its cap.
+        let (oldest, _oldest_ref) = Superseded::connect(&client, &server, &pool).await?;
+        let (middle, _middle_ref) = Superseded::connect(&client, &server, &pool).await?;
+
+        let (_newest, newest_incoming) = connect_pair(&client, &server).await?;
+        let newest = pool.handle_connection(newest_incoming).await?;
+        assert!(!newest.is_superseded(), "the adoption is not current");
+        tokio::time::timeout(SHORT_IDLE * 5, oldest.closed()).await?;
+        assert!(
+            middle.close_reason().is_none(),
+            "closed the connection within the cap"
         );
         server.close().await;
         Ok(())
