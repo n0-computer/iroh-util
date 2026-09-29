@@ -319,18 +319,25 @@ impl fmt::Display for ConnId {
 /// Reasons for which the pool may close a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseReason {
-    /// Nothing used it for [`Options::idle_timeout`], or it was evicted.
-    Unused,
-    /// Connection was dropped explicitly.
+    /// Nothing used it when the pool closed it.
     ///
-    /// Used when closing a connection via [`ConnectionPool::close`] or
-    /// when the pool is shutting down.
+    /// The pool closes a connection that was unused for
+    /// [`Options::idle_timeout`], or evicts it to make room. It also uses this
+    /// reason for an unused connection that [`ConnectionPool::close`] or the
+    /// pool shutting down closes.
+    Unused,
+    /// It was in use when [`ConnectionPool::close`] or the pool shutting down
+    /// closed it.
     Dropped,
     /// A newer connection to the peer took its place.
+    ///
+    /// The pool closes a superseded connection beyond
+    /// [`Options::max_superseded_per_peer`], and the connection of a dial that
+    /// an adoption won over.
     Superseded,
     /// The pool was full when the attempt that made it finished.
     TooManyConnections,
-    /// Rejected because [`Options::on_connected`] failed or timed out.
+    /// [`Options::on_connected`] failed.
     Rejected,
     /// The peer was closed while the attempt that made it was running.
     Closed,
@@ -451,6 +458,11 @@ impl PendingConnection {
             Origin::Dial => None,
             Origin::Incoming(connection) => Some(connection),
         }
+    }
+
+    /// Returns whether the attempt is a dial.
+    fn is_dial(&self) -> bool {
+        matches!(self.origin, Origin::Dial)
     }
 
     /// Retires the attempt and closes its connection, if it has one.
@@ -661,6 +673,11 @@ struct Actor {
     next_generation: Generation,
     /// Futures for connection close watchers, each yielding which connection closed.
     conn_close: FuturesUnordered<Boxed<ConnId>>,
+    /// Why the pool dropped each dial that is still running.
+    ///
+    /// A dial's connection only exists once the dial ends, so the pool closes
+    /// it then, with the reason it had when it dropped the dial.
+    dropped_dials: HashMap<ConnId, CloseReason>,
 }
 
 impl Actor {
@@ -683,6 +700,7 @@ impl Actor {
                 unused: UnusedSet::default(),
                 connecting: FuturesUnordered::new(),
                 conn_close: FuturesUnordered::new(),
+                dropped_dials: HashMap::new(),
                 next_generation: Generation(0),
             },
             tx,
@@ -968,10 +986,12 @@ impl Actor {
             .get_mut(&conn_id.peer)
             .and_then(|peer| peer.remove_attempt(conn_id.generation))
         else {
-            // PeerState was removed or changed in the meantime, discard the connection.
+            // The pool dropped the attempt in the meantime. An adoption's
+            // connection was closed then, and a dial's is closed now.
             debug!(%conn_id, "stale connect result, discarding");
-            if let Ok(connection) = result {
-                close_connection(&connection, CloseReason::Superseded);
+            let reason = self.dropped_dials.remove(&conn_id);
+            if let (Ok(connection), Some(reason)) = (result, reason) {
+                close_connection(&connection, reason);
             }
             return;
         };
@@ -1046,6 +1066,11 @@ impl Actor {
                     // has made one, is closed. Its result is discarded when it
                     // arrives.
                     debug!(%conn_id, "the new connection serves a running dial");
+                    let dial_id = ConnId {
+                        peer: conn_id.peer,
+                        generation: dial.generation,
+                    };
+                    self.dropped_dials.insert(dial_id, CloseReason::Superseded);
                     waiters.extend(dial.close_as(CloseReason::Superseded));
                 }
                 None => {}
@@ -1087,7 +1112,7 @@ impl Actor {
     ///
     /// A peer that opens connections in a loop would otherwise make the pool
     /// hold one per attempt, each until it goes unused. The oldest are closed,
-    /// in use or not, as [`ConnectionPool::close`] closes them.
+    /// in use or not.
     fn close_oldest_superseded(&mut self, id: EndpointId) {
         loop {
             let Some(peer) = self.peers.get_mut(&id) else {
@@ -1098,7 +1123,8 @@ impl Actor {
             }
             let conn = peer.superseded.remove(0);
             debug!(conn_id = %conn.conn_id(), "too many superseded connections, closing the oldest");
-            self.release(conn);
+            self.unused.remove(conn.conn_id());
+            conn.close_as(CloseReason::Superseded);
         }
     }
 
@@ -1167,6 +1193,13 @@ impl Actor {
         for attempt in attempts {
             // The connection an attempt has made is closed here. The attempt
             // runs to its end, and its result is discarded when it arrives.
+            if attempt.is_dial() {
+                let dial_id = ConnId {
+                    peer: id,
+                    generation: attempt.generation,
+                };
+                self.dropped_dials.insert(dial_id, CloseReason::Closed);
+            }
             fail_waiters(attempt.close_as(CloseReason::Closed), &cause);
         }
     }
@@ -2768,7 +2801,7 @@ mod tests {
         }
 
         let err = tokio::time::timeout(SHORT_IDLE * 5, connections[0].closed()).await?;
-        assert_closed_as(&err, CloseReason::Dropped);
+        assert_closed_as(&err, CloseReason::Superseded);
         assert!(
             connections[1].close_reason().is_none(),
             "closed the connection within the cap"
@@ -2845,10 +2878,7 @@ mod tests {
             "the dial did not report the close"
         );
         let err = tokio::time::timeout(SHORT_IDLE * 5, connection.closed()).await?;
-        assert!(
-            matches!(err, iroh::endpoint::ConnectionError::ApplicationClosed(_)),
-            "the connection was not closed by the pool: {err:?}"
-        );
+        assert_closed_as(&err, CloseReason::Closed);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
