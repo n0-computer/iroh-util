@@ -1,4 +1,4 @@
-//! A simple iroh connection pool
+//! A simple iroh connection pool.
 //!
 //! Entry point is [`ConnectionPool`]. You create a connection pool for a specific
 //! ALPN and [`Options`]. Then the pool will manage connections for you.
@@ -37,6 +37,9 @@ use n0_future::{
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, trace};
 
+/// A callback that runs for each new connection.
+///
+/// See [`Options::on_connected`].
 pub type OnConnected = Arc<
     dyn Fn(&Endpoint, &ConnectionRef) -> n0_future::future::Boxed<io::Result<()>> + Send + Sync,
 >;
@@ -44,7 +47,7 @@ pub type OnConnected = Arc<
 /// The pool is a single actor, so we can afford a larger inbox.
 const INBOX_CAPACITY: usize = 1024;
 
-/// Configuration options for the connection pool
+/// Configuration options for the connection pool.
 #[derive(derive_more::Debug, Clone)]
 pub struct Options {
     /// How long to keep unused connections around.
@@ -69,9 +72,10 @@ pub struct Options {
     /// peer that opens connections in a loop would make the pool hold one per
     /// attempt. Beyond this many, the oldest are closed, in use or not.
     pub max_superseded_per_peer: usize,
-    /// An optional callback that can be used to wait for the connection to enter some state.
-    /// An example usage could be to wait for the connection to become direct before handing
-    /// it out to the user.
+    /// An optional callback that runs before the pool hands out a new connection.
+    ///
+    /// Use it to wait for the connection to reach some state, for example to
+    /// wait for a direct path before the connection is handed out.
     ///
     /// It runs on the pool's task, so it must not block the thread: that would
     /// stall the whole pool. It is not bounded by [`Options::connect_timeout`]
@@ -83,12 +87,12 @@ pub struct Options {
     /// a connection the pool dialed, `Server` for one the peer opened.
     ///
     /// The [`ConnectionRef`] it receives counts as a use of the connection, and
-    /// is dropped when the callback returns. Hand a [`WeakConnectionRef`], via
+    /// is dropped when the callback returns. A task that holds a
+    /// [`ConnectionRef`] keeps the connection in use for as long as it runs.
+    /// The connection then never counts as unused, and the pool neither closes
+    /// nor evicts it. So hand a [`WeakConnectionRef`], via
     /// [`ConnectionRef::downgrade`], to anything that outlives the callback and
-    /// only watches the connection rather than using it: a task that holds a
-    /// [`ConnectionRef`] keeps the connection in use for as long as it runs, so
-    /// the connection never counts as unused and the pool neither closes nor
-    /// evicts it.
+    /// only watches the connection.
     #[debug(skip)]
     pub on_connected: Option<OnConnected>,
 }
@@ -106,7 +110,7 @@ impl Default for Options {
 }
 
 impl Options {
-    /// Set the on_connected callback
+    /// Sets the [`Options::on_connected`] callback.
     pub fn with_on_connected<F, Fut>(mut self, f: F) -> Self
     where
         F: Fn(Endpoint, ConnectionRef) -> Fut + Send + Sync + 'static,
@@ -224,28 +228,29 @@ impl WeakConnectionRef {
     }
 }
 
-/// Error when a connection can not be acquired
+/// An error returned when the pool cannot get a connection.
 ///
 /// This includes the normal iroh connection errors as well as pool specific
 /// errors such as timeouts and connection limits.
 #[stack_error(derive, add_meta)]
 #[derive(Clone)]
 pub enum PoolConnectError {
-    /// Connection pool is shut down
+    /// The connection pool is shut down.
     #[error("Connection pool is shut down")]
     Shutdown {},
+    /// The connection or its endpoint was closed before the pool handed it out.
     #[error("Connection was closed")]
     Closed {},
-    /// Timeout during connect
+    /// The dial did not finish within [`Options::connect_timeout`].
     #[error("Timeout during connect")]
     Timeout {},
-    /// Too many connections
+    /// The pool was full when the attempt finished.
     #[error("Too many connections")]
     TooManyConnections {},
-    /// Error during connect
+    /// The dial failed.
     #[error(transparent)]
     ConnectError { source: Arc<ConnectError> },
-    /// Error during on_connect callback
+    /// [`Options::on_connected`] failed.
     #[error(transparent)]
     OnConnectError {
         #[error(std_err)]
@@ -270,7 +275,7 @@ impl From<io::Error> for PoolConnectError {
 /// The only thing that can go wrong is that the connection pool is shut down.
 #[stack_error(derive, add_meta)]
 pub enum ConnectionPoolError {
-    /// The connection pool has been shut down
+    /// The connection pool has been shut down.
     #[error("The connection pool has been shut down")]
     Shutdown {},
 }
@@ -327,8 +332,7 @@ enum CloseReason {
     /// reason for an unused connection that [`ConnectionPool::close`] or the
     /// pool shutting down closes.
     Unused,
-    /// It was in use when [`ConnectionPool::close`] or the pool shutting down
-    /// closed it.
+    /// It was in use when [`ConnectionPool::close`] or shutdown closed it.
     Dropped,
     /// A newer connection to the peer took its place.
     ///
@@ -651,7 +655,7 @@ impl UnusedSet {
 type ConnectResult = (ConnId, Result<Connection, PoolConnectError>);
 
 struct Actor {
-    /// Inbox
+    /// The inbox for requests from [`ConnectionPool`] handles.
     rx: mpsc::Receiver<ActorMessage>,
     /// Separate inbox for unused events, gets processed before the main inbox.
     ///
@@ -1235,13 +1239,21 @@ impl Actor {
         }
     }
 }
-/// A connection pool
+/// A pool of connections to endpoints, for one ALPN.
+///
+/// Clones share the pool. Once the last clone is dropped, the pool closes
+/// every connection it holds.
 #[derive(Debug, Clone)]
 pub struct ConnectionPool {
     tx: mpsc::Sender<ActorMessage>,
 }
 
 impl ConnectionPool {
+    /// Creates a pool that dials with `endpoint`, for `alpn`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a Tokio runtime, since the pool spawns a task.
     pub fn new(endpoint: Endpoint, alpn: &[u8], options: Options) -> Self {
         let (actor, tx) = Actor::new(endpoint, alpn, options);
         n0_future::task::spawn(actor.run());
@@ -1285,6 +1297,14 @@ impl ConnectionPool {
     /// closed when it is unused instead, like any connection the pool holds.
     ///
     /// The pool does not check the connection's ALPN.
+    ///
+    /// # Errors
+    ///
+    /// - [`PoolConnectError::OnConnectError`] if `on_connected` fails.
+    /// - [`PoolConnectError::TooManyConnections`] if the pool is full.
+    /// - [`PoolConnectError::Closed`] if the connection closes before it is
+    ///   adopted, or [`Self::close`] closes its endpoint meanwhile.
+    /// - [`PoolConnectError::Shutdown`] if the pool is shut down.
     pub async fn handle_connection(
         &self,
         conn: Connection,
@@ -1698,8 +1718,7 @@ mod tests {
         Ok(())
     }
 
-    /// Tests that unused connections are being reclaimed to make room if we hit the
-    /// maximum connection limit.
+    /// Unused connections are evicted to make room at the connection limit.
     #[tokio::test]
     async fn connection_pool_unused() -> TestResult<()> {
         let n = 32;
@@ -1795,18 +1814,18 @@ mod tests {
         Ok(())
     }
 
-    /// Bind a UDP socket to a free loopback port and keep it alive for the
-    /// caller's lifetime. iroh `connect()` against this address will time
-    /// out (no QUIC handshake response), avoiding both hardcoded ports
-    /// (which can clash) and unbound ones (which OSes may rebind).
+    /// Binds a UDP socket on loopback that never answers.
+    ///
+    /// A dial to it times out, since nothing answers the QUIC handshake. The
+    /// caller keeps the socket, so the OS cannot give the port to another
+    /// socket. A fixed port could clash with other tests.
     fn dead_addr() -> TestResult<(std::net::UdpSocket, TransportAddr)> {
         let sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
         let addr = TransportAddr::Ip(sock.local_addr()?);
         Ok((sock, addr))
     }
 
-    /// Spawn `n` concurrent `get_or_connect(id)` calls and yield until each
-    /// task has at least entered its body.
+    /// Spawns `n` `get_or_connect(id)` calls and waits until each has started.
     async fn enter_get_or_connect(
         pool: ConnectionPool,
         id: EndpointId,
@@ -1830,11 +1849,11 @@ mod tests {
         handles
     }
 
-    /// Concurrent get_or_connect calls for an unreachable peer must not
-    /// prevent a probe against an unrelated reachable peer from completing
-    /// in bounded time.
+    /// Many requests for an unreachable peer do not stall a request for another.
+    ///
+    /// The request for the reachable peer must finish in bounded time.
     #[tokio::test]
-    async fn connection_pool_dead_peer_backlog_does_not_wedge() -> TestResult<()> {
+    async fn connection_pool_dead_peer_backlog_does_not_stall() -> TestResult<()> {
         let (live_ids, routers, address_lookup) = echo_servers(1).await?;
         let live_peer = live_ids[0];
 
@@ -1863,10 +1882,10 @@ mod tests {
 
         let backlog = enter_get_or_connect(pool.clone(), dead_peer, 150).await;
 
-        let probe_budget = connect_timeout * 5;
+        let probe_timeout = connect_timeout * 5;
         let probe = Instant::now();
         let probe_result =
-            n0_future::time::timeout(probe_budget, pool.get_or_connect(live_peer)).await;
+            n0_future::time::timeout(probe_timeout, pool.get_or_connect(live_peer)).await;
         let elapsed = probe.elapsed();
 
         for h in backlog {
@@ -1879,14 +1898,16 @@ mod tests {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => panic!("live-peer probe errored after {elapsed:?}: {e:?}"),
             Err(_) => {
-                panic!("live-peer probe did not complete within {probe_budget:?} — pool wedged")
+                panic!(
+                    "live-peer probe did not complete within {probe_timeout:?}: the pool stalled"
+                )
             }
         }
     }
 
     /// A smaller dead-peer backlog does not delay an unrelated peer at all.
     ///
-    /// Same setup as `connection_pool_dead_peer_backlog_does_not_wedge`, with a
+    /// Same setup as `connection_pool_dead_peer_backlog_does_not_stall`, with a
     /// stricter bound: the unrelated-peer probe must complete within one
     /// `connect_timeout` window.
     #[tokio::test]
@@ -2029,8 +2050,9 @@ mod tests {
         Ok(())
     }
 
-    /// Closing a slow connection attempt discards it. A later connect starts
-    /// a new attempt.
+    /// Closing a slow connection attempt discards it.
+    ///
+    /// A later connect starts a new attempt.
     #[tokio::test]
     async fn stale_connect_result_is_discarded() -> TestResult<()> {
         let (ids, routers, address_lookup) = echo_servers(1).await?;
@@ -2072,8 +2094,7 @@ mod tests {
         Ok(())
     }
 
-    /// Check that when a connection is closed, the pool will give you a new
-    /// connection next time you want one.
+    /// A closed connection is replaced on the next request.
     #[tokio::test]
     async fn watch_close() -> TestResult<()> {
         let n = 1;
@@ -3017,8 +3038,7 @@ mod tests {
         Ok(())
     }
 
-    /// [`ConnectionPool::close`] closes superseded connections too, even while
-    /// they are in use.
+    /// [`ConnectionPool::close`] closes superseded connections, even in use.
     #[tokio::test]
     async fn close_closes_superseded_connections() -> TestResult<()> {
         let s = Superseded::new(short_idle_options()).await?;
@@ -3178,7 +3198,7 @@ mod tests {
         let handle = handle.lock().expect("poisoned").take().expect("no handle");
         let stream_ref = handle.upgrade().expect("open");
 
-        // The pool has no address for `other`, so the attempt fails; what
+        // The pool has no address for `other`, so the attempt fails. What
         // matters is what the pool did not do to make room for it.
         let other = SecretKey::from_bytes(&[9u8; 32]).public();
         let res = pool.get_or_connect(other).await;
@@ -3293,7 +3313,7 @@ mod tests {
         assert!(weak.upgrade().is_some());
 
         pool.close(conn_ref.remote_id()).await?;
-        // `close` returns once the request is queued; wait for the pool to act.
+        // `close` returns once the request is queued. Wait for the pool to act.
         tokio::time::timeout(SHORT_IDLE * 5, conn_ref.closed()).await?;
         assert!(weak.upgrade().is_none(), "upgraded a closed connection");
         server.close().await;
