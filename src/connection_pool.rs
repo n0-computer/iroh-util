@@ -925,7 +925,14 @@ impl Actor {
             };
 
             if let Some(f) = &on_connected {
-                let conn_ref = ConnectionRef::new(connection.clone(), counter.get_one());
+                // The pool drops an attempt while it dials when the peer is
+                // closed, or when an adoption takes its place. Its result is
+                // stale then, and the pool closes the connection when it
+                // arrives, so `on_connected` must not hold it open.
+                let Some(permit) = counter.try_get_one() else {
+                    return (conn_id, Ok(connection));
+                };
+                let conn_ref = ConnectionRef::new(connection.clone(), permit);
                 if let Err(err) = f(&endpoint, &conn_ref).await {
                     // The pool never holds a rejected connection. Retire it
                     // before closing it, as the pool does.
@@ -1249,7 +1256,10 @@ impl ConnectionPool {
     /// An adoption that is still running has its connection closed right here.
     /// A dial that is still running does not: its connection only exists
     /// inside the dial. Its result is discarded when it arrives, and the
-    /// connection is closed then, so within [`Options::connect_timeout`].
+    /// connection is closed then. A dial that is still connecting skips
+    /// [`Options::on_connected`], so this happens within
+    /// [`Options::connect_timeout`]. A dial whose `on_connected` is running
+    /// is closed once the callback returns.
     pub async fn close(&self, id: EndpointId) -> std::result::Result<(), ConnectionPoolError> {
         self.tx
             .send(ActorMessage::ConnectionShutdown { id })
@@ -2763,14 +2773,17 @@ mod tests {
     ///
     /// The pool has nothing to close while the dial is still connecting. The
     /// dial's result is stale when it arrives, and the connection goes with it.
+    /// `on_connected` does not run for it, so it cannot hold the connection
+    /// open.
     #[tokio::test]
     async fn a_dial_that_connects_after_close_is_closed_when_it_ends() -> TestResult<()> {
+        let (options, calls) = slow_on_connected(Duration::from_secs(10));
         let server = incoming_server().await?;
         let client = iroh::Endpoint::bind(presets::Minimal).await?;
         let lookup = MemoryLookup::new();
         lookup.add_endpoint_info(server.addr());
         client.address_lookup()?.add(lookup);
-        let pool = ConnectionPool::new(client.clone(), INCOMING_ALPN, short_idle_options());
+        let pool = ConnectionPool::new(client.clone(), INCOMING_ALPN, options);
 
         let dial = tokio::spawn({
             let pool = pool.clone();
@@ -2792,6 +2805,11 @@ mod tests {
         assert!(
             matches!(err, iroh::endpoint::ConnectionError::ApplicationClosed(_)),
             "the connection was not closed by the pool: {err:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "ran `on_connected` for a closed peer"
         );
         server.close().await;
         Ok(())
