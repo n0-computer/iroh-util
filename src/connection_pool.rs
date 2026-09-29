@@ -989,31 +989,48 @@ impl Actor {
             self.drop_peer_if_empty(conn_id.peer);
             return;
         }
-        self.insert_current(conn, waiters);
+        self.insert_connection(conn, waiters);
     }
 
-    /// Makes `conn` the peer's current connection and hands it to `waiters`.
-    fn insert_current(&mut self, conn: PooledConnection, mut waiters: Vec<RefSender>) {
+    /// Adds `conn` to the pool and hands it to `waiters`.
+    ///
+    /// It becomes the peer's current connection, unless a newer one is current
+    /// already. Then it goes straight to the superseded ones.
+    fn insert_connection(&mut self, conn: PooledConnection, mut waiters: Vec<RefSender>) {
         let conn_id = conn.conn_id();
         let peer = self.peers.entry(conn_id.peer).or_default();
-        match peer.current.take() {
-            Some(PeerState::Ready(previous)) => {
-                // Two endpoints that dial each other at once each keep the
-                // connection they saw last, and may disagree, so the peer can
-                // still be using this one. It closes when it is unused, like
-                // any other connection the pool holds.
-                debug!(%conn_id, "the new connection supersedes the current one");
-                previous.counter.mark_superseded();
-                peer.superseded.push(previous);
+        // Adoptions can finish out of order, since each runs `on_connected` for
+        // as long as it takes. The connection the peer opened last wins, as it
+        // would have if they had finished in order. A dial never starts while
+        // an adoption runs, so only a newer adoption can be current here.
+        let newer_is_current = matches!(
+            &peer.current,
+            Some(PeerState::Ready(current)) if current.conn_id().generation > conn_id.generation
+        );
+        if newer_is_current {
+            debug!(%conn_id, "a newer connection is current, adding this one as superseded");
+            conn.counter.mark_superseded();
+        } else {
+            match peer.current.take() {
+                Some(PeerState::Ready(previous)) => {
+                    // Two endpoints that dial each other at once each keep the
+                    // connection they saw last, and may disagree, so the peer
+                    // can still be using this one. It closes when it is unused,
+                    // like any other connection the pool holds.
+                    debug!(%conn_id, "the new connection supersedes the current one");
+                    previous.counter.mark_superseded();
+                    peer.superseded.push(previous);
+                }
+                Some(PeerState::Connecting(dial)) => {
+                    // A dial that is still running loses to this connection.
+                    // Its waiters get this one, and its own connection, if it
+                    // has made one, is closed. Its result is discarded when it
+                    // arrives.
+                    debug!(%conn_id, "the new connection serves a running dial");
+                    waiters.extend(dial.close_as(CloseReason::Superseded));
+                }
+                None => {}
             }
-            Some(PeerState::Connecting(dial)) => {
-                // A dial that is still running loses to this connection. Its
-                // waiters get this one, and its own connection, if it has made
-                // one, is closed. Its result is discarded when it arrives.
-                debug!(%conn_id, "the new connection serves a running dial");
-                waiters.extend(dial.close_as(CloseReason::Superseded));
-            }
-            None => {}
         }
         for tx in waiters {
             // A caller that is gone takes no reference: it would put the
@@ -1026,7 +1043,15 @@ impl Actor {
         debug!(%conn_id, refs = conn.counter.current(), "connected");
         let connection = conn.connection.clone();
         let unused = conn.is_unused();
-        peer.current = Some(PeerState::Ready(conn));
+        if newer_is_current {
+            // Keep the list oldest first, which is the order the cap closes in.
+            let index = peer
+                .superseded
+                .partition_point(|superseded| superseded.conn_id().generation < conn_id.generation);
+            peer.superseded.insert(index, conn);
+        } else {
+            peer.current = Some(PeerState::Ready(conn));
+        }
 
         // Create a future that waits for the connection to close.
         self.conn_close.push(Box::pin(async move {
@@ -1190,6 +1215,10 @@ impl ConnectionPool {
     /// endpoint that is still running is dropped in its favor, and
     /// [`ConnectionRef::is_superseded`] tells holders of the previous connection
     /// to move on.
+    ///
+    /// If a connection the endpoint opened later became current first, because
+    /// its `on_connected` finished sooner, that one stays current. This one is
+    /// then returned as superseded.
     ///
     /// The previous connection is not closed right away. Two endpoints that dial
     /// each other at once each keep the connection they saw last, and may
@@ -1510,7 +1539,7 @@ mod tests {
         };
         let counter = ConnectionCounter::new(conn_id, actor.unused_tx.clone());
         let pooled = PooledConnection::new(conn.clone(), counter);
-        actor.insert_current(pooled, Vec::new());
+        actor.insert_connection(pooled, Vec::new());
         conn_id
     }
 
@@ -2584,6 +2613,48 @@ mod tests {
             matches!(again, Err(PoolConnectError::Closed { .. })),
             "adopted a closed connection: {again:?}"
         );
+        server.close().await;
+        Ok(())
+    }
+
+    /// An adoption that finishes after a newer one does not replace it.
+    ///
+    /// The connection the peer opened last is current, whichever adoption's
+    /// `on_connected` finished first.
+    #[tokio::test]
+    async fn an_older_adoption_that_finishes_last_is_superseded() -> TestResult<()> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let options = short_idle_options().with_on_connected({
+            let calls = calls.clone();
+            move |_ep, _conn: ConnectionRef| {
+                // The first adoption is slow, the ones after it are not.
+                let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                async move {
+                    if first {
+                        n0_future::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    Ok(())
+                }
+            }
+        });
+        let server = incoming_server().await?;
+        let client = iroh::Endpoint::bind(presets::Minimal).await?;
+        let pool = ConnectionPool::new(server.clone(), INCOMING_ALPN, options);
+        let (_older, older_incoming) = connect_pair(&client, &server).await?;
+        let (_newer, newer_incoming) = connect_pair(&client, &server).await?;
+
+        let older = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.handle_connection(older_incoming).await }
+        });
+        n0_future::time::sleep(Duration::from_millis(50)).await;
+        let newer = pool.handle_connection(newer_incoming).await?;
+        let older = older.await??;
+
+        assert!(older.is_superseded(), "the older connection is current");
+        assert!(!newer.is_superseded(), "an older connection superseded it");
+        let current = pool.get_or_connect(client.id()).await?;
+        assert_eq!(current.stable_id(), newer.stable_id());
         server.close().await;
         Ok(())
     }
