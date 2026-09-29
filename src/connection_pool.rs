@@ -783,6 +783,12 @@ impl Actor {
     /// [`ConnectionPool::handle_connection`].
     fn handle_incoming(&mut self, conn: Connection, tx: RefSender) {
         let id = conn.remote_id();
+        // A connection that has closed already would only take the place of
+        // one that works.
+        if conn.close_reason().is_some() {
+            let _ = tx.send(Err(e!(PoolConnectError::Closed)));
+            return;
+        }
         // The pool may hold this connection already, as the peer's current
         // connection or as one it superseded, or be adopting it. Adopting it
         // again would give one connection two generations and two reference
@@ -960,6 +966,15 @@ impl Actor {
                 return;
             }
         };
+        // The peer may have closed the connection while `on_connected` ran.
+        // Making it current would supersede a working connection with a dead
+        // one, and may evict another to make room for it.
+        if connection.close_reason().is_some() {
+            debug!(%conn_id, "the connection closed before it was ready");
+            fail_waiters(attempt.waiters, &e!(PoolConnectError::Closed));
+            self.drop_peer_if_empty(conn_id.peer);
+            return;
+        }
         let PendingConnection {
             counter, waiters, ..
         } = attempt;
@@ -2527,6 +2542,49 @@ mod tests {
             "the current connection changed"
         );
         s.server.close().await;
+        Ok(())
+    }
+
+    /// A connection that closes during its adoption does not become current.
+    ///
+    /// It would supersede the working connection with a dead one, and the next
+    /// request would dial although the working one is still open.
+    #[tokio::test]
+    async fn a_connection_that_closes_while_adopted_is_not_current() -> TestResult<()> {
+        let (options, _calls) = slow_on_connected(Duration::from_millis(300));
+        let server = incoming_server().await?;
+        let client = iroh::Endpoint::bind(presets::Minimal).await?;
+        let pool = ConnectionPool::new(server.clone(), INCOMING_ALPN, options);
+        let (_first, first_ref) = Superseded::connect(&client, &server, &pool).await?;
+
+        let (outgoing, incoming) = connect_pair(&client, &server).await?;
+        let adopting = tokio::spawn({
+            let pool = pool.clone();
+            let incoming = incoming.clone();
+            async move { pool.handle_connection(incoming).await }
+        });
+        n0_future::time::sleep(Duration::from_millis(50)).await;
+        outgoing.close(0u32.into(), b"gone");
+
+        let adopted = adopting.await?;
+        assert!(
+            matches!(adopted, Err(PoolConnectError::Closed { .. })),
+            "adopted a closed connection: {adopted:?}"
+        );
+        assert!(
+            !first_ref.is_superseded(),
+            "superseded by a closed connection"
+        );
+        let current = pool.get_or_connect(client.id()).await?;
+        assert_eq!(current.stable_id(), first_ref.stable_id());
+
+        // Once it has closed, it is refused right away.
+        let again = pool.handle_connection(incoming).await;
+        assert!(
+            matches!(again, Err(PoolConnectError::Closed { .. })),
+            "adopted a closed connection: {again:?}"
+        );
+        server.close().await;
         Ok(())
     }
 
