@@ -49,8 +49,8 @@ const INBOX_CAPACITY: usize = 1024;
 pub struct Options {
     /// How long to keep unused connections around.
     ///
-    /// Idle here means that there are no [`ConnectionRef`]s alive for the connection,
-    /// not that the connection itself is idle.
+    /// Unused means that there are no [`ConnectionRef`]s alive for the connection,
+    /// not that no data flows on it.
     pub idle_timeout: Duration,
     /// Timeout for connect.
     ///
@@ -184,8 +184,9 @@ impl ConnectionRef {
 /// close the connection while you use it: accepting a stream on a
 /// `WeakConnectionRef` is how an accept loop waits for work, and serving that
 /// stream belongs after [`Self::upgrade`]. Closing the connection through the
-/// deref goes behind the pool's back, which leaves the pool handing it out
-/// until its close event arrives. Use [`ConnectionPool::close`] instead.
+/// deref goes behind the pool's back: upgrades succeed until the pool handles
+/// its close event. [`ConnectionPool::close`] closes it through the pool,
+/// together with every other connection to the endpoint.
 #[derive(Debug, Clone)]
 pub struct WeakConnectionRef {
     connection: Connection,
@@ -658,8 +659,11 @@ struct Actor {
     unused_rx: mpsc::UnboundedReceiver<ConnId>,
     /// Sender for the unused inbox to be cloned into the connection counter.
     ///
-    /// This is unbounded so it can be used in Drop, but it is bounded by the number
-    /// of ConnectionRefs we give out, which is bounded by max_connections.
+    /// This is unbounded so it can be used in `Drop`. Nothing bounds it: every
+    /// drop of the last reference sends an event, and an upgrade followed by a
+    /// drop does that without going through the actor. The actor drains it
+    /// before anything else, so it only grows while events come in faster than
+    /// the actor handles them.
     unused_tx: mpsc::UnboundedSender<ConnId>,
     options: Options,
     endpoint: Endpoint,
@@ -927,7 +931,8 @@ impl Actor {
 
     /// Returns a future that dials the peer or adopts `incoming`.
     ///
-    /// The future runs `on_connected` as well, after the connect timeout.
+    /// The future runs `on_connected` as well, after the dial. The connect
+    /// timeout does not cover it.
     fn make_connect_future(
         &self,
         conn_id: ConnId,
@@ -1130,8 +1135,9 @@ impl Actor {
 
     /// Handles a connection closing, by us or by the peer.
     ///
-    /// Only acts if the pool still holds the connection. One the pool replaced
-    /// has closed already, and must not take down its successor.
+    /// Only acts if the pool still holds the connection. The event names one
+    /// connection, so an event for one the pool dropped already cannot remove
+    /// another connection to the same peer.
     fn handle_conn_closed(&mut self, conn_id: ConnId) {
         if self.remove_connection(conn_id).is_some() {
             trace!(%conn_id, "connection closed");
@@ -1244,9 +1250,10 @@ impl ConnectionPool {
 
     /// Returns either a fresh connection or a reference to an existing one.
     ///
-    /// This is guaranteed to return after approximately [Options::connect_timeout]
-    /// with either an error or a connection, plus the time [`Options::on_connected`]
-    /// takes.
+    /// A dial ends within [`Options::connect_timeout`], plus the time
+    /// [`Options::on_connected`] takes. A request for an endpoint the pool is
+    /// adopting a connection from waits for the adoption instead, which only
+    /// `on_connected` bounds.
     pub async fn get_or_connect(
         &self,
         id: EndpointId,
@@ -1263,8 +1270,8 @@ impl ConnectionPool {
     ///
     /// [`Options::on_connected`] runs for the connection as it would for a
     /// dialed one. Then the connection becomes the current one for its
-    /// endpoint: later [`Self::get_or_connect`] calls return it, a dial to the
-    /// endpoint that is still running is dropped in its favor, and
+    /// endpoint: later [`Self::get_or_connect`] calls return it, the waiters of
+    /// a dial to the endpoint that is still running get it, and
     /// [`ConnectionRef::is_superseded`] tells holders of the previous connection
     /// to move on.
     ///
@@ -1370,10 +1377,12 @@ const RETIRED: u64 = 1 << 63;
 /// The pool's hold on a connection's reference count, which retires it on drop.
 ///
 /// It is not `Clone`: the pool keeps one for each connection it holds or is
-/// making. Thus a counter is retired exactly when the pool stops holding its
+/// making. Thus a counter is retired when the pool stops holding its
 /// connection, and [`WeakConnectionRef::upgrade`] needs to check nothing else.
-/// Where the pool closes a connection, it drops the counter first, so no
-/// upgrade succeeds on a connection that is closed.
+/// The one other retirement is a connection that `on_connected` rejected,
+/// which the pool never holds. Where the pool closes a connection, it drops
+/// the counter first, so no upgrade succeeds on a connection that the pool
+/// closed.
 ///
 /// Weak references and the connect future hold the [`ConnectionCounterInner`]
 /// instead.
@@ -1419,8 +1428,9 @@ impl ConnectionCounter {
 
     /// Retires an unused connection, and returns whether it was unused.
     ///
-    /// If it returns `false`, a reference was taken in the meantime and the
-    /// pool keeps the connection. The caller closes the connection itself.
+    /// If it returns `true`, the caller removes the connection and closes it.
+    /// If it returns `false`, a reference was taken in the meantime, and the
+    /// pool keeps the connection.
     fn try_retire_unused(&self) -> bool {
         self.inner
             .state
@@ -2190,10 +2200,10 @@ mod tests {
 
     /// A stale close event leaves the current connection alone.
     ///
-    /// The event is for a connection the peer no longer has. The pool closes a
-    /// connection before it replaces it, and polls close events before its
-    /// inbox, so this cannot happen through the public API yet. The test calls
-    /// the handler directly.
+    /// The event is for a connection the pool no longer holds. That happens when
+    /// a request finds the current connection closed and removes it before its
+    /// close event arrives. The test calls the handler directly, so the order
+    /// of events is certain.
     #[tokio::test]
     async fn stale_close_event_keeps_the_current_connection() -> TestResult<()> {
         let (ids, routers, address_lookup) = echo_servers(1).await?;
@@ -2364,7 +2374,7 @@ mod tests {
     ///
     /// The event is for a connection the peer no longer has. References to a
     /// replaced connection can outlive it, and when the last one drops, its
-    /// event names the peer, whose current connection is another.
+    /// event names that connection, while the peer's current one is another.
     #[tokio::test]
     async fn stale_unused_event_keeps_the_idle_time() -> TestResult<()> {
         let (ids, routers, address_lookup) = echo_servers(1).await?;
@@ -2987,7 +2997,7 @@ mod tests {
         let pool = ConnectionPool::new(server.clone(), INCOMING_ALPN, options);
         let (outgoing, conn_ref) = Superseded::connect(&client, &server, &pool).await?;
         drop(conn_ref);
-        // Let the connection actor see the connection go unused and start its
+        // Let the actor see the connection go unused and start its
         // timer before the reference comes in.
         n0_future::time::sleep(SHORT_IDLE / 4).await;
         let handle = handle.lock().expect("poisoned").take().expect("no handle");
@@ -3132,12 +3142,11 @@ mod tests {
         Ok(())
     }
 
-    /// A full pool does not evict a peer that is in use again.
+    /// A full pool does not evict a connection that is in use again.
     ///
-    /// An upgraded [`WeakConnectionRef`] put it back in use.
-    ///
-    /// Such a reference does not go through the pool, so the peer is still on
-    /// the list of unused peers that eviction picks from.
+    /// An upgraded [`WeakConnectionRef`] put it back in use. Such a reference
+    /// does not go through the pool, so the connection is still on the list of
+    /// unused connections that eviction picks from.
     #[tokio::test]
     async fn eviction_skips_a_peer_in_use_again() -> TestResult<()> {
         let handle = Arc::new(std::sync::Mutex::new(None));
