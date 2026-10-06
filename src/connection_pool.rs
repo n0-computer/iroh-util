@@ -48,7 +48,22 @@ pub type OnConnected = Arc<
 const INBOX_CAPACITY: usize = 1024;
 
 /// Configuration options for the connection pool.
+///
+/// Start from [`Options::default`] and set the fields you need. The struct is
+/// `#[non_exhaustive]`, so new options can be added without breaking callers.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use iroh_util::connection_pool::Options;
+///
+/// let mut options = Options::default();
+/// options.idle_timeout = Duration::from_secs(30);
+/// ```
 #[derive(derive_more::Debug, Clone)]
+#[non_exhaustive]
 pub struct Options {
     /// How long to keep unused connections around.
     ///
@@ -234,6 +249,7 @@ impl WeakConnectionRef {
 /// errors such as timeouts and connection limits.
 #[stack_error(derive, add_meta)]
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum PoolConnectError {
     /// The connection pool is shut down.
     #[error("Connection pool is shut down")]
