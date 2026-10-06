@@ -15,7 +15,7 @@
 //! This is using a single actor to manage all connections.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     fmt, io,
     ops::Deref,
     sync::{
@@ -26,7 +26,7 @@ use std::{
 
 use iroh::{
     Endpoint, EndpointId,
-    endpoint::{ConnectError, Connection, VarInt},
+    endpoint::{ConnectError, Connection, Side, VarInt},
 };
 use n0_error::{e, stack_error};
 use n0_future::{
@@ -392,7 +392,6 @@ impl PooledConnection {
 /// An attempt to get a connection to a peer: a dial, or an adoption.
 #[derive(Debug)]
 struct PendingConnection {
-    generation: Generation,
     counter: ConnectionCounter,
     origin: Origin,
     /// Callers of [`ConnectionPool::handle_connection`] for this connection.
@@ -417,10 +416,6 @@ impl PendingConnection {
             Origin::Dial => None,
             Origin::Incoming(connection) => Some(connection),
         }
-    }
-
-    fn is_dial(&self) -> bool {
-        matches!(self.origin, Origin::Dial)
     }
 
     /// Retires the attempt and closes its connection, if any, returning the waiters.
@@ -534,14 +529,14 @@ impl Peer {
 
     /// Removes the attempt with `generation`: a dial, an adoption, or an overtaken dial.
     fn remove_attempt(&mut self, generation: Generation) -> Option<PendingConnection> {
-        let is_attempt = |current: &mut PeerState| matches!(current, PeerState::Connecting(attempt) if attempt.generation == generation);
+        let is_attempt = |current: &mut PeerState| matches!(current, PeerState::Connecting(attempt) if attempt.counter.conn_id().generation == generation);
         if let Some(PeerState::Connecting(attempt)) = self.current.take_if(is_attempt) {
             return Some(attempt);
         }
         for attempts in [&mut self.adopting, &mut self.overtaken_dials] {
             if let Some(index) = attempts
                 .iter()
-                .position(|attempt| attempt.generation == generation)
+                .position(|attempt| attempt.counter.conn_id().generation == generation)
             {
                 return Some(attempts.remove(index));
             }
@@ -627,10 +622,6 @@ struct Actor {
     next_generation: Generation,
     /// Futures for connection close watchers, each yielding which connection closed.
     conn_close: FuturesUnordered<Boxed<ConnId>>,
-    /// Dropped dials, whose connections the pool closes once they end.
-    ///
-    /// [`ConnectionPool::close`] and the shutdown drop dials.
-    dropped_dials: HashSet<ConnId>,
 }
 
 impl Actor {
@@ -653,7 +644,6 @@ impl Actor {
                 unused: UnusedSet::default(),
                 connecting: FuturesUnordered::new(),
                 conn_close: FuturesUnordered::new(),
-                dropped_dials: HashSet::new(),
                 next_generation: Generation(0),
             },
             tx,
@@ -797,7 +787,6 @@ impl Actor {
             Origin::Incoming(_) => (vec![tx], Vec::new()),
         };
         let pending = PendingConnection {
-            generation: conn_id.generation,
             counter,
             origin,
             callers,
@@ -928,10 +917,10 @@ impl Actor {
             .get_mut(&conn_id.peer)
             .and_then(|peer| peer.remove_attempt(conn_id.generation))
         else {
-            // The pool dropped the attempt in the meantime. An adoption's
+            // Only `close` and shutdown drop an attempt. An adoption's
             // connection was closed then, and a dial's is closed now.
             debug!(%conn_id, "stale connect result, discarding");
-            if let (Ok(connection), true) = (result, self.dropped_dials.remove(&conn_id)) {
+            if let Ok(connection) = result {
                 close_connection(&connection, CloseReason::Closed);
             }
             return;
@@ -958,7 +947,6 @@ impl Actor {
             close_connection(&connection, CloseReason::TooManyConnections);
             return;
         }
-        let dialed = attempt.is_dial();
         let PendingConnection {
             counter,
             mut callers,
@@ -967,7 +955,7 @@ impl Actor {
         } = attempt;
         callers.extend(requests);
         let conn = PooledConnection::new(connection, counter);
-        self.insert_connection(conn, callers, dialed);
+        self.insert_connection(conn, callers);
     }
 
     /// Retires a failed attempt and fails its callers with `cause`.
@@ -1003,18 +991,12 @@ impl Actor {
     /// Adds `conn` to the pool and hands it to `waiters`.
     ///
     /// It becomes current, unless it is an adoption and a newer connection is
-    /// current already. A connection we `dialed` always becomes current: the
-    /// peer adopts it as its newest, so both ends agree on it.
-    fn insert_connection(
-        &mut self,
-        conn: PooledConnection,
-        mut waiters: Vec<RefSender>,
-        dialed: bool,
-    ) {
+    /// current already. A connection we dialed always becomes current.
+    fn insert_connection(&mut self, conn: PooledConnection, mut waiters: Vec<RefSender>) {
         let conn_id = conn.conn_id();
         let peer = self.peers.entry(conn_id.peer).or_default();
         // Adoptions finish out of order, and the one the peer opened last wins.
-        let newer_is_current = !dialed
+        let newer_is_current = conn.connection.side() == Side::Server
             && matches!(
                 &peer.current,
                 Some(PeerState::Ready(current)) if current.conn_id().generation > conn_id.generation
@@ -1147,13 +1129,6 @@ impl Actor {
             self.release(conn);
         }
         for attempt in attempts {
-            if attempt.is_dial() {
-                let dial_id = ConnId {
-                    peer: id,
-                    generation: attempt.generation,
-                };
-                self.dropped_dials.insert(dial_id);
-            }
             fail_waiters(attempt.close_as(CloseReason::Closed), &cause);
         }
     }
@@ -1740,11 +1715,7 @@ mod tests {
                 generation: Generation(1),
             };
             let counter = ConnectionCounter::new(conn_id, actor.unused_tx.clone());
-            actor.insert_connection(
-                PooledConnection::new(conn.clone(), counter),
-                Vec::new(),
-                false,
-            );
+            actor.insert_connection(PooledConnection::new(conn.clone(), counter), Vec::new());
             Ok(Self {
                 actor,
                 conn_id,
