@@ -800,6 +800,8 @@ impl Actor {
         // connection that the adoption supersedes right away.
         // If the adoption fails, the request is handled again.
         if let Some(attempt) = self.peers.get_mut(&id).and_then(Peer::pending_mut) {
+            // Callers that gave up would otherwise stay until the attempt ends.
+            attempt.requests.retain(|tx| !tx.is_closed());
             attempt.requests.push(tx);
             return;
         }
@@ -843,6 +845,7 @@ impl Actor {
             .get_mut(&id)
             .and_then(|peer| peer.adoption_mut(&conn))
         {
+            attempt.callers.retain(|tx| !tx.is_closed());
             attempt.callers.push(tx);
             return;
         }
@@ -1576,7 +1579,7 @@ mod tests {
 
     use super::{
         Actor, CloseReason, ConnId, ConnectionCounter, ConnectionPool, ConnectionRef, Generation,
-        OnConnected, Options, PeerState, PoolConnectError, PooledConnection, RequestRef,
+        OnConnected, Options, Peer, PeerState, PoolConnectError, PooledConnection, RequestRef,
     };
 
     const ECHO_ALPN: &[u8] = b"echo";
@@ -3364,6 +3367,31 @@ mod tests {
             "upgraded a retired connection"
         );
         assert!(!counter.try_retire_unused(), "retired twice");
+    }
+
+    /// Requests whose callers gave up do not pile up on a running attempt.
+    #[tokio::test]
+    async fn cancelled_requests_do_not_pile_up() -> TestResult<()> {
+        let endpoint = iroh::Endpoint::bind(presets::Minimal).await?;
+        let (mut actor, _tx) = Actor::new(endpoint.clone(), ECHO_ALPN, test_options());
+        let peer = SecretKey::from_bytes(&[6u8; 32]).public();
+        for _ in 0..10 {
+            let (tx, rx) = oneshot::channel();
+            drop(rx);
+            actor.handle_request(RequestRef { id: peer, tx });
+        }
+        let attempt = actor
+            .peers
+            .get_mut(&peer)
+            .and_then(Peer::pending_mut)
+            .expect("no attempt");
+        assert_eq!(
+            attempt.requests.len(),
+            1,
+            "kept requests whose callers are gone"
+        );
+        endpoint.close().await;
+        Ok(())
     }
 
     /// The last reference to drop reports which connection went unused.
