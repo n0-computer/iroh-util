@@ -6,8 +6,8 @@
 //! Access to connections is via the [`ConnectionPool::get_or_connect`] method, which
 //! gives you access to a connection via a [`ConnectionRef`] if possible.
 //! Connections the remote opened can be handed to the pool with
-//! [`ConnectionPool::handle_connection`], so a protocol that both dials and
-//! accepts uses one connection per endpoint for both.
+//! [`ConnectionPool::handle_connection`]. A protocol that both dials and
+//! accepts then uses one connection per endpoint for both.
 //!
 //! It is important that you keep the [`ConnectionRef`] alive while you are using
 //! the connection.
@@ -68,9 +68,9 @@ pub struct Options {
     pub max_connections: usize,
     /// Maximum number of superseded connections to keep per peer.
     ///
-    /// A connection the peer superseded stays open while the peer uses it, so a
-    /// peer that opens connections in a loop would make the pool hold one per
-    /// attempt. Beyond this many, the oldest are closed, in use or not.
+    /// A connection the peer superseded stays open while the peer uses it. A
+    /// peer that opens connections in a loop would thus make the pool hold one
+    /// per attempt. Beyond this many, the oldest are closed, in use or not.
     pub max_superseded_per_peer: usize,
     /// An optional callback that runs before the pool hands out a new connection.
     ///
@@ -78,9 +78,9 @@ pub struct Options {
     /// wait for a direct path before the connection is handed out.
     ///
     /// It runs on the pool's task, so it must not block the thread: that would
-    /// stall the whole pool. It is not bounded by [`Options::connect_timeout`]
-    /// either, and requests for the connection wait for it, so keep it short,
-    /// or give it a timeout of its own.
+    /// stall the whole pool. [`Options::connect_timeout`] does not bound it,
+    /// and requests for the connection wait for it. Keep it short, or give it
+    /// a timeout of its own.
     ///
     /// It also runs for connections handed to [`ConnectionPool::handle_connection`].
     /// Which of the two it is running for is [`Connection::side`]: `Client` for
@@ -150,9 +150,9 @@ impl ConnectionRef {
 
     /// Returns whether a newer connection to the same endpoint superseded this one.
     ///
-    /// A superseded connection stays open for as long as it is used, but new
-    /// work should move to the current one, which [`ConnectionPool::get_or_connect`]
-    /// returns: the old one may lead to an endpoint that has since restarted,
+    /// A superseded connection stays open for as long as it is used. New work
+    /// should move to the current one, which [`ConnectionPool::get_or_connect`]
+    /// returns. The old one may lead to an endpoint that has since restarted,
     /// dead without us having noticed yet.
     pub fn is_superseded(&self) -> bool {
         self.permit.is_superseded()
@@ -171,23 +171,23 @@ impl ConnectionRef {
 
 /// A reference to a pooled connection that does not keep it in use.
 ///
-/// It relates to [`ConnectionRef`] as `Weak` does to `Arc`: holding one does not
-/// count as a use, so a task that watches the connection for as long as it lives
-/// can hold it, and [`Self::upgrade`] returns a reference that does count. As
+/// It relates to [`ConnectionRef`] as `Weak` does to `Arc`. Holding one does
+/// not count as a use, so a task that watches the connection for as long as it
+/// lives can hold it. [`Self::upgrade`] returns a reference that does count. As
 /// with `Weak`, upgrading fails once the connection is gone: once the pool no
 /// longer holds it. Unlike `Weak`, it keeps the connection handle itself alive,
 /// and it derefs to the connection.
 ///
 /// A task that outlives [`Options::on_connected`] and only watches the
 /// connection takes one, via [`ConnectionRef::downgrade`]. Work that should
-/// keep the connection open upgrades it, and that includes serving streams the
-/// remote opened: the remote may keep using a connection the pool has
+/// keep the connection open upgrades it. That includes serving streams the
+/// remote opened, since the remote may keep using a connection the pool has
 /// superseded.
 ///
 /// What you reach through the deref is not counted as a use, so the pool can
-/// close the connection while you use it: accepting a stream on a
-/// `WeakConnectionRef` is how an accept loop waits for work, and serving that
-/// stream belongs after [`Self::upgrade`]. Closing the connection through the
+/// close the connection while you use it. An accept loop waits for work by
+/// accepting a stream on a `WeakConnectionRef`, and serves the stream after
+/// [`Self::upgrade`]. Closing the connection through the
 /// deref goes behind the pool's back: upgrades succeed until the pool handles
 /// its close event. [`ConnectionPool::close`] closes it through the pool,
 /// together with every other connection to the endpoint.
@@ -670,7 +670,7 @@ struct Actor {
     /// Sender for the unused inbox to be cloned into the connection counter.
     ///
     /// This is unbounded so it can be used in `Drop`. Nothing bounds it: every
-    /// drop of the last reference sends an event, and an upgrade followed by a
+    /// drop of the last reference sends an event. An upgrade followed by a
     /// drop does that without going through the actor. The actor drains it
     /// before anything else, so it only grows while events come in faster than
     /// the actor handles them.
@@ -796,16 +796,16 @@ impl Actor {
             return;
         }
         // An attempt is running. An adoption counts: once it is adopted, its
-        // connection is the one requests get, so dialing as well would make a
-        // connection that the adoption supersedes right away.
-        // If the adoption fails, the request is handled again.
+        // connection is the one requests get. Dialing as well would make a
+        // connection that the adoption supersedes right away. If the adoption
+        // fails, the request is handled again.
         if let Some(attempt) = self.peers.get_mut(&id).and_then(Peer::pending_mut) {
             // Callers that gave up would otherwise stay until the attempt ends.
             attempt.requests.retain(|tx| !tx.is_closed());
             attempt.requests.push(tx);
             return;
         }
-        // Whether there is room is decided when the attempt finishes: what the
+        // Whether there is room is decided when the attempt finishes. What the
         // pool holds may have changed by then, and only then is there a
         // connection to evict for.
         self.start_attempt(id, None, tx);
@@ -827,7 +827,7 @@ impl Actor {
         // The pool may hold this connection already, as the peer's current
         // connection or as one it superseded, or be adopting it. Adopting it
         // again would give one connection two generations and two reference
-        // counts, and closing either would close the connection the other one
+        // counts. Closing either would close the connection the other one
         // still hands out.
         if let Some(pooled) = self
             .peers
@@ -1035,10 +1035,10 @@ impl Actor {
             self.fail_attempt(conn_id.peer, attempt, e!(PoolConnectError::Closed));
             return;
         }
-        // Connections made since this attempt started may have filled the pool. A
-        // connection this one supersedes stays open, so an attempt that
-        // finishes adds one to the connections the pool holds, unless that
-        // pushes the peer's superseded connections over the cap.
+        // Connections made since this attempt started may have filled the pool.
+        // A connection this one supersedes stays open, so an attempt that
+        // finishes adds one to the connections the pool holds. The exception
+        // is a peer whose superseded connections are at the cap.
         if self.adding_grows(conn_id.peer) && !self.make_room() {
             debug!(%conn_id, "connected, but the pool is full");
             let cause = e!(PoolConnectError::TooManyConnections);
@@ -1060,7 +1060,7 @@ impl Actor {
     /// Retires a failed attempt, and fails its callers with `cause`.
     ///
     /// Requests that joined an adoption want any connection to the peer, not
-    /// this one, so they are handled again as if they had just come in. They
+    /// this one. So they are handled again, as if they had just come in. They
     /// get the current connection, wait for another attempt, or start a dial.
     /// The requests of a dial fail, since the dial was made for them.
     fn fail_attempt(
@@ -1112,7 +1112,7 @@ impl Actor {
             match peer.current.take() {
                 Some(PeerState::Ready(previous)) => {
                     // Two endpoints that dial each other at once each keep the
-                    // connection they saw last, and may disagree, so the peer
+                    // connection they saw last. They may disagree, so the peer
                     // can still be using this one. It closes when it is unused,
                     // like any other connection the pool holds.
                     debug!(%conn_id, "the new connection supersedes the current one");
@@ -1333,17 +1333,19 @@ impl ConnectionPool {
     ///
     /// [`Options::on_connected`] runs for the connection as it would for a
     /// dialed one. Then the connection becomes the current one for its
-    /// endpoint: later [`Self::get_or_connect`] calls return it, the waiters of
-    /// a dial to the endpoint that is still running get it, and
-    /// [`ConnectionRef::is_superseded`] tells holders of the previous connection
-    /// to move on.
+    /// endpoint:
+    ///
+    /// - Later [`Self::get_or_connect`] calls return it.
+    /// - The waiters of a dial to the endpoint that is still running get it.
+    /// - [`ConnectionRef::is_superseded`] tells holders of the previous
+    ///   connection to move on.
     ///
     /// If a connection the endpoint opened later became current first, because
     /// its `on_connected` finished sooner, that one stays current. This one is
     /// then returned as superseded.
     ///
     /// The previous connection is not closed right away. Two endpoints that dial
-    /// each other at once each keep the connection they saw last, and may
+    /// each other at once each keep the connection they saw last. They may
     /// disagree, so the remote can still be using the one we superseded. It is
     /// closed when it is unused instead, like any connection the pool holds.
     ///
@@ -2446,8 +2448,8 @@ mod tests {
     /// A stale unused event leaves the current connection's idle time alone.
     ///
     /// The event is for a connection the peer no longer has. References to a
-    /// replaced connection can outlive it, and when the last one drops, its
-    /// event names that connection, while the peer's current one is another.
+    /// replaced connection can outlive it. When the last one drops, its event
+    /// names that connection, while the peer's current one is another.
     #[tokio::test]
     async fn stale_unused_event_keeps_the_idle_time() -> TestResult<()> {
         let (ids, routers, address_lookup) = echo_servers(1).await?;
@@ -3058,7 +3060,7 @@ mod tests {
     /// A superseded connection stays open for as long as something uses it.
     ///
     /// Two endpoints that dial each other at once each keep the connection they
-    /// saw last, and may disagree, so the remote can still be using the one we
+    /// saw last. They may disagree, so the remote can still be using the one we
     /// superseded.
     #[tokio::test]
     async fn superseded_connection_stays_open_while_used() -> TestResult<()> {
