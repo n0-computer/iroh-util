@@ -1582,6 +1582,7 @@ mod tests {
     use super::{
         Actor, CloseReason, ConnId, ConnectionCounter, ConnectionPool, ConnectionRef, Generation,
         OnConnected, Options, Peer, PeerState, PoolConnectError, PooledConnection, RequestRef,
+        WeakConnectionRef,
     };
 
     const ECHO_ALPN: &[u8] = b"echo";
@@ -3207,12 +3208,27 @@ mod tests {
         Ok(())
     }
 
+    /// Waits until the pool no longer holds the connection behind `weak`.
+    async fn until_retired(weak: &WeakConnectionRef) -> TestResult<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while weak.upgrade().is_some() {
+                n0_future::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "the pool kept the connection")?;
+        Ok(())
+    }
+
     /// A superseded connection closing leaves the current one alone.
     #[tokio::test]
     async fn superseded_connection_closing_keeps_the_current_one() -> TestResult<()> {
         let s = Superseded::new(short_idle_options()).await?;
+        // `first_ref` keeps the connection in use, so only its close event can
+        // make the pool drop it.
+        let first = s.first_ref.downgrade();
         s.first.close(0u32.into(), b"bye");
-        n0_future::time::sleep(SHORT_IDLE).await;
+        until_retired(&first).await?;
 
         assert!(
             s.second.close_reason().is_none(),
@@ -3371,6 +3387,90 @@ mod tests {
         assert!(!counter.try_retire_unused(), "retired twice");
     }
 
+    /// An actor that holds one unused connection, upgraded meanwhile.
+    ///
+    /// The connection is on the unused list, but a [`WeakConnectionRef`] took
+    /// a reference without going through the actor.
+    struct Upgraded {
+        actor: Actor,
+        conn_id: ConnId,
+        /// The server end, which the actor holds.
+        conn: Connection,
+        conn_ref: ConnectionRef,
+        server: iroh::Endpoint,
+        _outgoing: Connection,
+        _client: iroh::Endpoint,
+    }
+
+    impl Upgraded {
+        async fn new(options: Options) -> TestResult<Self> {
+            let server = incoming_server().await?;
+            let client = iroh::Endpoint::bind(presets::Minimal).await?;
+            let (outgoing, conn) = connect_pair(&client, &server).await?;
+            let (mut actor, _tx) = Actor::new(server.clone(), INCOMING_ALPN, options);
+            let conn_id = insert_ready(&mut actor, &conn);
+            assert!(actor.unused.oldest().is_some(), "the connection is in use");
+            let weak = actor
+                .connection(conn_id)
+                .expect("not held")
+                .conn_ref()
+                .downgrade();
+            let conn_ref = weak.upgrade().expect("not held");
+            Ok(Self {
+                actor,
+                conn_id,
+                conn,
+                conn_ref,
+                server,
+                _outgoing: outgoing,
+                _client: client,
+            })
+        }
+
+        /// Asserts that the actor still holds the connection, and it is open.
+        fn assert_kept(&self) {
+            assert!(
+                self.actor.connection(self.conn_id).is_some(),
+                "dropped a connection in use"
+            );
+            assert!(
+                self.conn.close_reason().is_none(),
+                "closed a connection in use"
+            );
+        }
+    }
+
+    /// The idle timeout does not close a connection that was upgraded meanwhile.
+    #[tokio::test]
+    async fn close_unused_keeps_an_upgraded_connection() -> TestResult<()> {
+        let options = test_options();
+        let idle_timeout = options.idle_timeout;
+        let mut u = Upgraded::new(options).await?;
+
+        n0_future::time::sleep(idle_timeout * 2).await;
+        u.actor.close_unused();
+        u.assert_kept();
+        drop(u.conn_ref);
+        u.server.close().await;
+        Ok(())
+    }
+
+    /// A full pool does not evict a connection that was upgraded meanwhile.
+    #[tokio::test]
+    async fn make_room_keeps_an_upgraded_connection() -> TestResult<()> {
+        let mut u = Upgraded::new(Options {
+            max_connections: 1,
+            ..test_options()
+        })
+        .await?;
+
+        assert!(!u.actor.make_room(), "made room in a pool that is in use");
+        u.assert_kept();
+        drop(u.conn_ref);
+        u.server.close().await;
+        Ok(())
+    }
+
     /// Requests whose callers gave up do not pile up on a running attempt.
     #[tokio::test]
     async fn cancelled_requests_do_not_pile_up() -> TestResult<()> {
@@ -3462,13 +3562,7 @@ mod tests {
         drop(conn_ref);
 
         outgoing.close(0u32.into(), b"gone");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while weak.upgrade().is_some() {
-                n0_future::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .map_err(|_| "upgrades kept succeeding after the remote closed")?;
+        until_retired(&weak).await?;
         server.close().await;
         Ok(())
     }
