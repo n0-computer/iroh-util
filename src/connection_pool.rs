@@ -15,7 +15,7 @@
 //! This is using a single actor to manage all connections.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt, io,
     ops::Deref,
     sync::{
@@ -461,13 +461,21 @@ struct Peer {
     current: Option<PeerState>,
     /// Connections the peer opened that the pool is adopting, oldest first.
     adopting: Vec<PendingConnection>,
+    /// Dials that an adopted connection overtook.
+    ///
+    /// Each becomes current once it connects, as the peer adopts it as its
+    /// newest connection.
+    overtaken_dials: Vec<PendingConnection>,
     /// Connections that a newer one took the place of, oldest first.
     superseded: Vec<PooledConnection>,
 }
 
 impl Peer {
     fn is_empty(&self) -> bool {
-        self.current.is_none() && self.adopting.is_empty() && self.superseded.is_empty()
+        self.current.is_none()
+            && self.adopting.is_empty()
+            && self.overtaken_dials.is_empty()
+            && self.superseded.is_empty()
     }
 
     /// Returns the peer's current connection.
@@ -524,17 +532,21 @@ impl Peer {
         Some(self.superseded.remove(index))
     }
 
-    /// Removes the attempt with `generation`, a dial or an adoption.
+    /// Removes the attempt with `generation`: a dial, an adoption, or an overtaken dial.
     fn remove_attempt(&mut self, generation: Generation) -> Option<PendingConnection> {
         let is_attempt = |current: &mut PeerState| matches!(current, PeerState::Connecting(attempt) if attempt.generation == generation);
         if let Some(PeerState::Connecting(attempt)) = self.current.take_if(is_attempt) {
             return Some(attempt);
         }
-        let index = self
-            .adopting
-            .iter()
-            .position(|attempt| attempt.generation == generation)?;
-        Some(self.adopting.remove(index))
+        for attempts in [&mut self.adopting, &mut self.overtaken_dials] {
+            if let Some(index) = attempts
+                .iter()
+                .position(|attempt| attempt.generation == generation)
+            {
+                return Some(attempts.remove(index));
+            }
+        }
+        None
     }
 }
 
@@ -615,8 +627,10 @@ struct Actor {
     next_generation: Generation,
     /// Futures for connection close watchers, each yielding which connection closed.
     conn_close: FuturesUnordered<Boxed<ConnId>>,
-    /// The reason to close each dropped dial's connection with, once it ends.
-    dropped_dials: HashMap<ConnId, CloseReason>,
+    /// Dropped dials, whose connections the pool closes once they end.
+    ///
+    /// [`ConnectionPool::close`] and the shutdown drop dials.
+    dropped_dials: HashSet<ConnId>,
 }
 
 impl Actor {
@@ -639,7 +653,7 @@ impl Actor {
                 unused: UnusedSet::default(),
                 connecting: FuturesUnordered::new(),
                 conn_close: FuturesUnordered::new(),
-                dropped_dials: HashMap::new(),
+                dropped_dials: HashSet::new(),
                 next_generation: Generation(0),
             },
             tx,
@@ -917,9 +931,8 @@ impl Actor {
             // The pool dropped the attempt in the meantime. An adoption's
             // connection was closed then, and a dial's is closed now.
             debug!(%conn_id, "stale connect result, discarding");
-            let reason = self.dropped_dials.remove(&conn_id);
-            if let (Ok(connection), Some(reason)) = (result, reason) {
-                close_connection(&connection, reason);
+            if let (Ok(connection), true) = (result, self.dropped_dials.remove(&conn_id)) {
+                close_connection(&connection, CloseReason::Closed);
             }
             return;
         };
@@ -945,6 +958,7 @@ impl Actor {
             close_connection(&connection, CloseReason::TooManyConnections);
             return;
         }
+        let dialed = attempt.is_dial();
         let PendingConnection {
             counter,
             mut callers,
@@ -953,7 +967,7 @@ impl Actor {
         } = attempt;
         callers.extend(requests);
         let conn = PooledConnection::new(connection, counter);
-        self.insert_connection(conn, callers);
+        self.insert_connection(conn, callers, dialed);
     }
 
     /// Retires a failed attempt and fails its callers with `cause`.
@@ -988,16 +1002,23 @@ impl Actor {
 
     /// Adds `conn` to the pool and hands it to `waiters`.
     ///
-    /// It becomes current, unless a newer connection is current already.
-    fn insert_connection(&mut self, conn: PooledConnection, mut waiters: Vec<RefSender>) {
+    /// It becomes current, unless it is an adoption and a newer connection is
+    /// current already. A connection we `dialed` always becomes current: the
+    /// peer adopts it as its newest, so both ends agree on it.
+    fn insert_connection(
+        &mut self,
+        conn: PooledConnection,
+        mut waiters: Vec<RefSender>,
+        dialed: bool,
+    ) {
         let conn_id = conn.conn_id();
         let peer = self.peers.entry(conn_id.peer).or_default();
         // Adoptions finish out of order, and the one the peer opened last wins.
-        // No dial starts while an adoption runs, so only adoptions compare here.
-        let newer_is_current = matches!(
-            &peer.current,
-            Some(PeerState::Ready(current)) if current.conn_id().generation > conn_id.generation
-        );
+        let newer_is_current = !dialed
+            && matches!(
+                &peer.current,
+                Some(PeerState::Ready(current)) if current.conn_id().generation > conn_id.generation
+            );
         if newer_is_current {
             debug!(%conn_id, "a newer connection is current, adding this one as superseded");
             conn.counter.mark_superseded();
@@ -1009,15 +1030,13 @@ impl Actor {
                     previous.counter.mark_superseded();
                     peer.superseded.push(previous);
                 }
-                Some(PeerState::Connecting(dial)) => {
-                    // A running dial loses, and its waiters get this connection.
+                Some(PeerState::Connecting(mut dial)) => {
+                    // The dial's waiters get this connection. The dial runs on:
+                    // the peer adopts its connection as the newest, so it becomes
+                    // current once it connects.
                     debug!(%conn_id, "the new connection serves a running dial");
-                    let dial_id = ConnId {
-                        peer: conn_id.peer,
-                        generation: dial.generation,
-                    };
-                    self.dropped_dials.insert(dial_id, CloseReason::Superseded);
-                    waiters.extend(dial.close_as(CloseReason::Superseded));
+                    waiters.append(&mut dial.requests);
+                    peer.overtaken_dials.push(dial);
                 }
                 None => {}
             }
@@ -1114,9 +1133,11 @@ impl Actor {
         let Peer {
             current,
             adopting,
+            overtaken_dials,
             superseded,
         } = peer;
         let mut attempts = adopting;
+        attempts.extend(overtaken_dials);
         match current {
             Some(PeerState::Ready(conn)) => self.release(conn),
             Some(PeerState::Connecting(attempt)) => attempts.push(attempt),
@@ -1131,7 +1152,7 @@ impl Actor {
                     peer: id,
                     generation: attempt.generation,
                 };
-                self.dropped_dials.insert(dial_id, CloseReason::Closed);
+                self.dropped_dials.insert(dial_id);
             }
             fail_waiters(attempt.close_as(CloseReason::Closed), &cause);
         }
@@ -1206,7 +1227,9 @@ impl ConnectionPool {
     /// endpoint:
     ///
     /// - Later [`Self::get_or_connect`] calls return it.
-    /// - The waiters of a dial to the endpoint that is still running get it.
+    /// - The waiters of a dial to the endpoint that is still running get it. The
+    ///   dial runs on, as the endpoint adopts its connection as the newest.
+    ///   Once it connects, it becomes current in turn, and supersedes this one.
     /// - [`ConnectionRef::is_superseded`] tells holders of the previous
     ///   connection to move on.
     ///
@@ -1717,7 +1740,11 @@ mod tests {
                 generation: Generation(1),
             };
             let counter = ConnectionCounter::new(conn_id, actor.unused_tx.clone());
-            actor.insert_connection(PooledConnection::new(conn.clone(), counter), Vec::new());
+            actor.insert_connection(
+                PooledConnection::new(conn.clone(), counter),
+                Vec::new(),
+                false,
+            );
             Ok(Self {
                 actor,
                 conn_id,
@@ -2555,6 +2582,49 @@ mod tests {
         n0_future::time::sleep(Duration::from_millis(600)).await;
         assert!(outgoing.close_reason().is_none(), "closed the adopted one");
         assert_eq!(net.current().await?.stable_id(), conn_ref.stable_id());
+        net.server.close().await;
+        Ok(())
+    }
+
+    /// A dial that an adopted connection overtook becomes current once it connects.
+    ///
+    /// The peer adopts the dialed connection as its newest, so both ends agree
+    /// on it. The pool closed it once the dial ended, which cut off the
+    /// connection the peer used.
+    #[tokio::test]
+    async fn an_overtaken_dial_becomes_current() -> TestResult<()> {
+        let net = Incoming::new(short_idle_options()).await?;
+        let peer = Endpoint::builder(presets::Minimal)
+            .alpns(vec![INCOMING_ALPN.to_vec()])
+            .bind()
+            .await?;
+        net.server
+            .address_lookup()?
+            .add(MemoryLookup::from_endpoint_info([peer.addr()]));
+
+        let dial = spawn_get(&net.pool, peer.id());
+        // The handshake waits for the peer, so the dial is still connecting.
+        let dialed = peer.accept().await.expect("endpoint closed");
+        let (_outgoing, incoming) = net.pair_from(&peer).await?;
+        let adopted = net.pool.handle_connection(incoming).await?;
+        assert_eq!(dial.await??.stable_id(), adopted.stable_id());
+        let dialed = dialed.await?;
+
+        let current = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = net.pool.get_or_connect(peer.id()).await?;
+                if current.stable_id() != adopted.stable_id() {
+                    return Ok::<_, PoolConnectError>(current);
+                }
+                n0_future::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        assert_eq!(current.remote_id(), peer.id());
+        assert!(adopted.is_superseded(), "the adoption stayed current");
+        n0_future::time::sleep(SHORT_IDLE * 5).await;
+        assert!(dialed.close_reason().is_none(), "closed the overtaken dial");
+        peer.close().await;
         net.server.close().await;
         Ok(())
     }
