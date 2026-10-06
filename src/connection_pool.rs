@@ -440,8 +440,12 @@ struct PendingConnection {
     /// The reference count of the connection the attempt will produce.
     counter: ConnectionCounter,
     origin: Origin,
-    /// Who is waiting for the connection.
-    waiters: Vec<RefSender>,
+    /// Callers of [`ConnectionPool::handle_connection`] for this connection.
+    ///
+    /// A dial has none.
+    callers: Vec<RefSender>,
+    /// Callers of [`ConnectionPool::get_or_connect`], which want any connection.
+    requests: Vec<RefSender>,
 }
 
 /// Where a pending connection comes from.
@@ -472,21 +476,23 @@ impl PendingConnection {
 
     /// Retires the attempt and closes its connection, if it has one.
     ///
-    /// Returns the waiters, for the caller to serve or fail. The attempt runs
-    /// until it finishes, and its result is discarded. A dial's connection is
-    /// closed then.
+    /// Returns everyone who waits for it, for the caller to serve or fail. The
+    /// attempt runs until it finishes, and its result is discarded. A dial's
+    /// connection is closed then.
     fn close_as(self, reason: CloseReason) -> Vec<RefSender> {
         let Self {
             counter,
             origin,
-            waiters,
+            mut callers,
+            requests,
             ..
         } = self;
         drop(counter);
         if let Origin::Incoming(connection) = origin {
             close_connection(&connection, reason);
         }
-        waiters
+        callers.extend(requests);
+        callers
     }
 }
 
@@ -792,8 +798,9 @@ impl Actor {
         // An attempt is running. An adoption counts: once it is adopted, its
         // connection is the one requests get, so dialing as well would make a
         // connection that the adoption supersedes right away.
+        // If the adoption fails, the request is handled again.
         if let Some(attempt) = self.peers.get_mut(&id).and_then(Peer::pending_mut) {
-            attempt.waiters.push(tx);
+            attempt.requests.push(tx);
             return;
         }
         // Whether there is room is decided when the attempt finishes: what the
@@ -836,7 +843,7 @@ impl Actor {
             .get_mut(&id)
             .and_then(|peer| peer.adoption_mut(&conn))
         {
-            attempt.waiters.push(tx);
+            attempt.callers.push(tx);
             return;
         }
         self.start_attempt(id, Some(conn), tx);
@@ -854,11 +861,16 @@ impl Actor {
             Some(connection) => Origin::Incoming(connection.clone()),
             None => Origin::Dial,
         };
+        let (callers, requests) = match origin {
+            Origin::Dial => (Vec::new(), vec![tx]),
+            Origin::Incoming(_) => (vec![tx], Vec::new()),
+        };
         let pending = PendingConnection {
             generation: conn_id.generation,
             counter,
             origin,
-            waiters: vec![tx],
+            callers,
+            requests,
         };
         let peer = self.peers.entry(id).or_default();
         if incoming.is_some() {
@@ -1008,8 +1020,7 @@ impl Actor {
             Ok(connection) => connection,
             Err(cause) => {
                 debug!(%conn_id, "attempt failed: {cause:?}");
-                fail_waiters(attempt.waiters, &cause);
-                self.drop_peer_if_empty(conn_id.peer);
+                self.fail_attempt(conn_id.peer, attempt, cause);
                 return;
             }
         };
@@ -1018,26 +1029,62 @@ impl Actor {
         // one, and may evict another to make room for it.
         if connection.close_reason().is_some() {
             debug!(%conn_id, "the connection closed before it was ready");
-            fail_waiters(attempt.waiters, &e!(PoolConnectError::Closed));
-            self.drop_peer_if_empty(conn_id.peer);
+            self.fail_attempt(conn_id.peer, attempt, e!(PoolConnectError::Closed));
             return;
         }
-        let PendingConnection {
-            counter, waiters, ..
-        } = attempt;
-        let conn = PooledConnection::new(connection, counter);
         // Connections made since this attempt started may have filled the pool. A
         // connection this one supersedes stays open, so an attempt that
         // finishes adds one to the connections the pool holds, unless that
         // pushes the peer's superseded connections over the cap.
         if self.adding_grows(conn_id.peer) && !self.make_room() {
             debug!(%conn_id, "connected, but the pool is full");
-            conn.close_as(CloseReason::TooManyConnections);
-            fail_waiters(waiters, &e!(PoolConnectError::TooManyConnections));
-            self.drop_peer_if_empty(conn_id.peer);
+            let cause = e!(PoolConnectError::TooManyConnections);
+            self.fail_attempt(conn_id.peer, attempt, cause);
+            close_connection(&connection, CloseReason::TooManyConnections);
             return;
         }
-        self.insert_connection(conn, waiters);
+        let PendingConnection {
+            counter,
+            mut callers,
+            requests,
+            ..
+        } = attempt;
+        callers.extend(requests);
+        let conn = PooledConnection::new(connection, counter);
+        self.insert_connection(conn, callers);
+    }
+
+    /// Retires a failed attempt, and fails its callers with `cause`.
+    ///
+    /// Requests that joined an adoption want any connection to the peer, not
+    /// this one, so they are handled again as if they had just come in. They
+    /// get the current connection, wait for another attempt, or start a dial.
+    /// The requests of a dial fail, since the dial was made for them.
+    fn fail_attempt(
+        &mut self,
+        id: EndpointId,
+        attempt: PendingConnection,
+        cause: PoolConnectError,
+    ) {
+        let PendingConnection {
+            counter,
+            origin,
+            callers,
+            requests,
+            ..
+        } = attempt;
+        drop(counter);
+        fail_waiters(callers, &cause);
+        match origin {
+            Origin::Dial => fail_waiters(requests, &cause),
+            Origin::Incoming(_) => {
+                // A caller that is gone would only start a dial for nobody.
+                for tx in requests.into_iter().filter(|tx| !tx.is_closed()) {
+                    self.handle_request(RequestRef { id, tx });
+                }
+            }
+        }
+        self.drop_peer_if_empty(id);
     }
 
     /// Adds `conn` to the pool and hands it to `waiters`.
@@ -1265,7 +1312,8 @@ impl ConnectionPool {
     /// A dial ends within [`Options::connect_timeout`], plus the time
     /// [`Options::on_connected`] takes. A request for an endpoint the pool is
     /// adopting a connection from waits for the adoption instead, which only
-    /// `on_connected` bounds.
+    /// `on_connected` bounds. If the adoption fails, the request is handled
+    /// again: it gets the current connection, or a dial.
     pub async fn get_or_connect(
         &self,
         id: EndpointId,
@@ -2773,6 +2821,59 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "the request dialed as well"
+        );
+        server.close().await;
+        Ok(())
+    }
+
+    /// A request that joined a failed adoption gets the current connection.
+    ///
+    /// It wants any connection to the peer, so the adoption's error is not its
+    /// own.
+    #[tokio::test]
+    async fn a_request_outlives_a_failed_adoption() -> TestResult<()> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let options = short_idle_options().with_on_connected({
+            let calls = calls.clone();
+            move |_ep, _conn: ConnectionRef| {
+                // The first adoption succeeds, and the second fails later.
+                let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                async move {
+                    if first {
+                        n0_future::time::sleep(Duration::from_millis(300)).await;
+                        Ok(())
+                    } else {
+                        n0_future::time::sleep(Duration::from_millis(600)).await;
+                        Err(io::Error::other("rejected"))
+                    }
+                }
+            }
+        });
+        let server = incoming_server().await?;
+        let client = iroh::Endpoint::bind(presets::Minimal).await?;
+        let pool = ConnectionPool::new(server.clone(), INCOMING_ALPN, options);
+        let (_first, first_incoming) = connect_pair(&client, &server).await?;
+        let (_second, second_incoming) = connect_pair(&client, &server).await?;
+
+        let first = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.handle_connection(first_incoming).await }
+        });
+        n0_future::time::sleep(Duration::from_millis(50)).await;
+        let second = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.handle_connection(second_incoming).await }
+        });
+        n0_future::time::sleep(Duration::from_millis(50)).await;
+
+        // Nothing is ready yet, so the request joins the newest adoption.
+        let requested = pool.get_or_connect(client.id()).await?;
+        let first = first.await??;
+        assert_eq!(requested.stable_id(), first.stable_id());
+        let second = second.await?;
+        assert!(
+            matches!(second, Err(PoolConnectError::OnConnectError { .. })),
+            "the failed adoption succeeded: {second:?}"
         );
         server.close().await;
         Ok(())
