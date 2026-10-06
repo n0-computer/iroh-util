@@ -49,8 +49,7 @@ const INBOX_CAPACITY: usize = 1024;
 
 /// Configuration options for the connection pool.
 ///
-/// Start from [`Options::default`] and set the fields you need. The struct is
-/// `#[non_exhaustive]`, so new options can be added without breaking callers.
+/// Start from [`Options::default`] and set the fields you need.
 ///
 /// # Examples
 ///
@@ -70,44 +69,26 @@ pub struct Options {
     /// Unused means that there are no [`ConnectionRef`]s alive for the connection,
     /// not that no data flows on it.
     pub idle_timeout: Duration,
-    /// Timeout for connect.
-    ///
-    /// This covers the dial only. [`Options::on_connected`] runs after it, for
-    /// as long as it takes.
+    /// Timeout for the dial. [`Options::on_connected`] runs after it.
     pub connect_timeout: Duration,
-    /// Maximum number of connections the pool holds.
+    /// Maximum number of connections the pool holds, superseded ones included.
     ///
-    /// Connections a newer one superseded count, since they stay open until
-    /// they are unused. Attempts that are still running do not, so attempts to
-    /// peers that do not answer cannot take the place of connections.
+    /// Running attempts do not count, so peers that do not answer cannot fill
+    /// the pool.
     pub max_connections: usize,
     /// Maximum number of superseded connections to keep per peer.
     ///
-    /// A connection the peer superseded stays open while the peer uses it. A
-    /// peer that opens connections in a loop would thus make the pool hold one
-    /// per attempt. Beyond this many, the oldest are closed, in use or not.
+    /// Beyond this many, the oldest are closed, even if in use.
     pub max_superseded_per_peer: usize,
     /// An optional callback that runs before the pool hands out a new connection.
     ///
-    /// Use it to wait for the connection to reach some state, for example to
-    /// wait for a direct path before the connection is handed out.
+    /// Use it to wait for the connection to reach some state, such as a direct
+    /// path. It runs for dialed and adopted connections alike, which
+    /// [`Connection::side`] tells apart. It runs on the pool's task and must
+    /// not block. No timeout bounds it, and requests wait for it.
     ///
-    /// It runs on the pool's task, so it must not block the thread: that would
-    /// stall the whole pool. [`Options::connect_timeout`] does not bound it,
-    /// and requests for the connection wait for it. Keep it short, or give it
-    /// a timeout of its own.
-    ///
-    /// It also runs for connections handed to [`ConnectionPool::handle_connection`].
-    /// Which of the two it is running for is [`Connection::side`]: `Client` for
-    /// a connection the pool dialed, `Server` for one the peer opened.
-    ///
-    /// The [`ConnectionRef`] it receives counts as a use of the connection, and
-    /// is dropped when the callback returns. A task that holds a
-    /// [`ConnectionRef`] keeps the connection in use for as long as it runs.
-    /// The connection then never counts as unused, and the pool neither closes
-    /// nor evicts it. So hand a [`WeakConnectionRef`], via
-    /// [`ConnectionRef::downgrade`], to anything that outlives the callback and
-    /// only watches the connection.
+    /// A [`ConnectionRef`] kept past the callback keeps the connection in use,
+    /// so the pool never closes it. Keep a [`WeakConnectionRef`] instead.
     #[debug(skip)]
     pub on_connected: Option<OnConnected>,
 }
@@ -165,10 +146,8 @@ impl ConnectionRef {
 
     /// Returns whether a newer connection to the same endpoint superseded this one.
     ///
-    /// A superseded connection stays open for as long as it is used. New work
-    /// should move to the current one, which [`ConnectionPool::get_or_connect`]
-    /// returns. The old one may lead to an endpoint that has since restarted,
-    /// dead without us having noticed yet.
+    /// A superseded connection stays open while in use, but new work should use
+    /// the one [`ConnectionPool::get_or_connect`] returns.
     pub fn is_superseded(&self) -> bool {
         self.permit.is_superseded()
     }
@@ -186,26 +165,13 @@ impl ConnectionRef {
 
 /// A reference to a pooled connection that does not keep it in use.
 ///
-/// It relates to [`ConnectionRef`] as `Weak` does to `Arc`. Holding one does
-/// not count as a use, so a task that watches the connection for as long as it
-/// lives can hold it. [`Self::upgrade`] returns a reference that does count. As
-/// with `Weak`, upgrading fails once the connection is gone: once the pool no
-/// longer holds it. Unlike `Weak`, it keeps the connection handle itself alive,
-/// and it derefs to the connection.
+/// It relates to [`ConnectionRef`] as `Weak` does to `Arc`: [`Self::upgrade`]
+/// returns a counting reference while the pool holds the connection. Unlike
+/// `Weak`, it keeps the connection handle alive and derefs to it.
 ///
-/// A task that outlives [`Options::on_connected`] and only watches the
-/// connection takes one, via [`ConnectionRef::downgrade`]. Work that should
-/// keep the connection open upgrades it. That includes serving streams the
-/// remote opened, since the remote may keep using a connection the pool has
-/// superseded.
-///
-/// What you reach through the deref is not counted as a use, so the pool can
-/// close the connection while you use it. An accept loop waits for work by
-/// accepting a stream on a `WeakConnectionRef`, and serves the stream after
-/// [`Self::upgrade`]. Closing the connection through the
-/// deref goes behind the pool's back: upgrades succeed until the pool handles
-/// its close event. [`ConnectionPool::close`] closes it through the pool,
-/// together with every other connection to the endpoint.
+/// Use it in tasks that only watch the connection, such as an accept loop, and
+/// upgrade before serving a stream. The deref does not count as a use, so the
+/// pool can close the connection while you use it that way.
 #[derive(Debug, Clone)]
 pub struct WeakConnectionRef {
     connection: Connection,
@@ -223,13 +189,8 @@ impl Deref for WeakConnectionRef {
 impl WeakConnectionRef {
     /// Returns a reference that keeps the connection in use, if the pool holds it.
     ///
-    /// Returns `None` once the pool no longer holds the connection. The pool
-    /// stops holding it before it closes it. A connection that closes
-    /// otherwise stays in the pool until its close event arrives. An upgrade in
-    /// that window returns a reference that fails on first use.
-    ///
-    /// An upgrade and the pool closing an unused connection cannot both
-    /// succeed: whichever comes first wins.
+    /// The pool holds a connection the remote closed until it handles the close
+    /// event, so the reference may already be closed.
     pub fn upgrade(&self) -> Option<ConnectionRef> {
         let permit = self.counter.try_get_one()?;
         Some(ConnectionRef::new(self.connection.clone(), permit))
@@ -342,19 +303,10 @@ impl fmt::Display for ConnId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseReason {
     /// Nothing used it when the pool closed it.
-    ///
-    /// The pool closes a connection that was unused for
-    /// [`Options::idle_timeout`], or evicts it to make room. It also uses this
-    /// reason for an unused connection that [`ConnectionPool::close`] or the
-    /// pool shutting down closes.
     Unused,
     /// It was in use when [`ConnectionPool::close`] or shutdown closed it.
     Dropped,
     /// A newer connection to the peer took its place.
-    ///
-    /// The pool closes a superseded connection beyond
-    /// [`Options::max_superseded_per_peer`], and the connection of a dial that
-    /// an adoption won over.
     Superseded,
     /// The pool was full when the attempt that made it finished.
     TooManyConnections,
@@ -384,17 +336,13 @@ impl CloseReason {
 }
 
 /// Closes `connection`, telling the peer why.
-///
-/// Every connection the pool closes goes through here, so a peer always gets a
-/// [`CloseReason`] rather than a bare code.
 fn close_connection(connection: &Connection, reason: CloseReason) {
     connection.close(reason.code(), reason.reason());
 }
 
 /// A connection the pool holds, with its reference count.
 ///
-/// It is not `Clone`: the one value lives in the actor's peer map, and dropping
-/// it retires the counter. See [`ConnectionCounter`].
+/// It is not `Clone`, since dropping it retires the counter.
 #[derive(Debug)]
 struct PooledConnection {
     connection: Connection,
@@ -402,7 +350,6 @@ struct PooledConnection {
 }
 
 impl PooledConnection {
-    /// Pairs a connection with the counter that was made for it.
     fn new(connection: Connection, counter: ConnectionCounter) -> Self {
         Self {
             connection,
@@ -410,22 +357,18 @@ impl PooledConnection {
         }
     }
 
-    /// Returns which connection this is.
     fn conn_id(&self) -> ConnId {
         self.counter.conn_id()
     }
 
-    /// Returns a reference that counts as a use of the connection.
     fn conn_ref(&self) -> ConnectionRef {
         ConnectionRef::new(self.connection.clone(), self.counter.get_one())
     }
 
-    /// Returns whether nothing uses the connection.
     fn is_unused(&self) -> bool {
         self.counter.is_unused()
     }
 
-    /// Closes the connection, with a reason that says whether it was in use.
     fn close(self) {
         let reason = if self.is_unused() {
             CloseReason::Unused
@@ -435,7 +378,7 @@ impl PooledConnection {
         self.close_as(reason);
     }
 
-    /// Retires the connection, and closes it with `reason`.
+    /// Retires the connection, then closes it, so no upgrade sees it closed.
     fn close_as(self, reason: CloseReason) {
         let Self {
             connection,
@@ -446,19 +389,13 @@ impl PooledConnection {
     }
 }
 
-/// An attempt to get a connection to a peer.
-///
-/// The attempt is a dial, or the adoption of a connection the peer opened. Both
-/// run [`Options::on_connected`] before the connection is handed out.
+/// An attempt to get a connection to a peer: a dial, or an adoption.
 #[derive(Debug)]
 struct PendingConnection {
     generation: Generation,
-    /// The reference count of the connection the attempt will produce.
     counter: ConnectionCounter,
     origin: Origin,
     /// Callers of [`ConnectionPool::handle_connection`] for this connection.
-    ///
-    /// A dial has none.
     callers: Vec<RefSender>,
     /// Callers of [`ConnectionPool::get_or_connect`], which want any connection.
     requests: Vec<RefSender>,
@@ -467,10 +404,7 @@ struct PendingConnection {
 /// Where a pending connection comes from.
 #[derive(Debug)]
 enum Origin {
-    /// The pool is dialing the peer.
-    ///
-    /// The connection only exists inside the dial, so the pool has nothing to
-    /// close for it until the dial finishes.
+    /// The connection exists only once the dial ends.
     Dial,
     /// The peer opened the connection, and the pool is adopting it.
     Incoming(Connection),
@@ -485,16 +419,11 @@ impl PendingConnection {
         }
     }
 
-    /// Returns whether the attempt is a dial.
     fn is_dial(&self) -> bool {
         matches!(self.origin, Origin::Dial)
     }
 
-    /// Retires the attempt and closes its connection, if it has one.
-    ///
-    /// Returns everyone who waits for it, for the caller to serve or fail. The
-    /// attempt runs until it finishes, and its result is discarded. A dial's
-    /// connection is closed then.
+    /// Retires the attempt and closes its connection, if any, returning the waiters.
     fn close_as(self, reason: CloseReason) -> Vec<RefSender> {
         let Self {
             counter,
@@ -512,7 +441,6 @@ impl PendingConnection {
     }
 }
 
-/// Fails every waiter with `cause`.
 fn fail_waiters(waiters: Vec<RefSender>, cause: &PoolConnectError) {
     for tx in waiters {
         let _ = tx.send(Err(cause.clone()));
@@ -532,18 +460,12 @@ struct Peer {
     /// The connection requests get, or the attempt that will make it.
     current: Option<PeerState>,
     /// Connections the peer opened that the pool is adopting, oldest first.
-    ///
-    /// The current connection keeps serving requests until one is adopted.
     adopting: Vec<PendingConnection>,
     /// Connections that a newer one took the place of, oldest first.
-    ///
-    /// The peer may still be using one, so it stays open until it is unused
-    /// for [`Options::idle_timeout`], as a current connection would.
     superseded: Vec<PooledConnection>,
 }
 
 impl Peer {
-    /// Returns whether the pool holds nothing for the peer any more.
     fn is_empty(&self) -> bool {
         self.current.is_none() && self.adopting.is_empty() && self.superseded.is_empty()
     }
@@ -564,10 +486,7 @@ impl Peer {
             .find(|conn| conn.conn_id() == conn_id)
     }
 
-    /// Returns the connection the pool holds for `connection`, if it has it.
-    ///
-    /// Connections are compared by their stable id, which is unique among the
-    /// connections that are open.
+    /// Returns the pooled connection with the same stable id as `connection`.
     fn find_by_connection(&self, connection: &Connection) -> Option<&PooledConnection> {
         self.ready()
             .into_iter()
@@ -584,10 +503,7 @@ impl Peer {
         })
     }
 
-    /// Returns the attempt whose connection becomes the peer's current one.
-    ///
-    /// That is the dial that is running, or else the newest adoption, whose
-    /// connection supersedes whatever the peer has when it is adopted.
+    /// Returns the running dial, or else the newest adoption.
     fn pending_mut(&mut self) -> Option<&mut PendingConnection> {
         match &mut self.current {
             Some(PeerState::Connecting(attempt)) => Some(attempt),
@@ -685,11 +601,7 @@ struct Actor {
     unused_rx: mpsc::UnboundedReceiver<ConnId>,
     /// Sender for the unused inbox to be cloned into the connection counter.
     ///
-    /// This is unbounded so it can be used in `Drop`. Nothing bounds it: every
-    /// drop of the last reference sends an event. An upgrade followed by a
-    /// drop does that without going through the actor. The actor drains it
-    /// before anything else, so it only grows while events come in faster than
-    /// the actor handles them.
+    /// Unbounded, so that `Drop` can send.
     unused_tx: mpsc::UnboundedSender<ConnId>,
     options: Options,
     endpoint: Endpoint,
@@ -703,10 +615,7 @@ struct Actor {
     next_generation: Generation,
     /// Futures for connection close watchers, each yielding which connection closed.
     conn_close: FuturesUnordered<Boxed<ConnId>>,
-    /// Why the pool dropped each dial that is still running.
-    ///
-    /// A dial's connection only exists once the dial ends, so the pool closes
-    /// it then, with the reason it had when it dropped the dial.
+    /// The reason to close each dropped dial's connection with, once it ends.
     dropped_dials: HashMap<ConnId, CloseReason>,
 }
 
@@ -811,12 +720,8 @@ impl Actor {
             let _ = tx.send(Ok(conn_ref));
             return;
         }
-        // An attempt is running. An adoption counts: once it is adopted, its
-        // connection is the one requests get. Dialing as well would make a
-        // connection that the adoption supersedes right away. If the adoption
-        // fails, the request is handled again.
+        // An adoption counts: its connection will be the one requests get.
         if let Some(attempt) = self.peers.get_mut(&id).and_then(Peer::pending_mut) {
-            // Callers that gave up would otherwise stay until the attempt ends.
             attempt.requests.retain(|tx| !tx.is_closed());
             attempt.requests.push(tx);
             return;
@@ -829,22 +734,15 @@ impl Actor {
 
     /// Starts adopting a connection the peer opened.
     ///
-    /// Its `on_connected` runs like a dial's, and the connection becomes the
-    /// peer's current one once it has finished. See
-    /// [`ConnectionPool::handle_connection`].
+    /// See [`ConnectionPool::handle_connection`].
     fn handle_incoming(&mut self, conn: Connection, tx: RefSender) {
         let id = conn.remote_id();
-        // A connection that has closed already would only take the place of
-        // one that works.
         if conn.close_reason().is_some() {
             let _ = tx.send(Err(e!(PoolConnectError::Closed)));
             return;
         }
-        // The pool may hold this connection already, as the peer's current
-        // connection or as one it superseded, or be adopting it. Adopting it
-        // again would give one connection two generations and two reference
-        // counts. Closing either would close the connection the other one
-        // still hands out.
+        // Adopting a connection twice would give it two counters, and closing
+        // one would close the connection the other still hands out.
         if let Some(pooled) = self
             .peers
             .get(&id)
@@ -915,8 +813,6 @@ impl Actor {
     }
 
     /// Returns the number of connections the pool holds, current and superseded.
-    ///
-    /// This is what [`Options::max_connections`] limits.
     fn connection_count(&self) -> usize {
         self.peers
             .values()
@@ -926,9 +822,7 @@ impl Actor {
 
     /// Returns whether adding a connection to the peer grows the pool.
     ///
-    /// It does not when the peer has a current connection and its superseded
-    /// ones are at [`Options::max_superseded_per_peer`]. One of them becomes
-    /// superseded, and the cap closes the oldest.
+    /// At [`Options::max_superseded_per_peer`], the cap closes one as it adds one.
     fn adding_grows(&self, id: EndpointId) -> bool {
         self.peers.get(&id).is_none_or(|peer| {
             peer.ready().is_none() || peer.superseded.len() < self.options.max_superseded_per_peer
@@ -964,10 +858,7 @@ impl Actor {
         self.remove_connection(conn_id)
     }
 
-    /// Returns a future that dials the peer or adopts `incoming`.
-    ///
-    /// The future runs `on_connected` as well, after the dial. The connect
-    /// timeout does not cover it.
+    /// Returns a future that dials the peer or adopts `incoming`, then runs `on_connected`.
     fn make_connect_future(
         &self,
         conn_id: ConnId,
@@ -994,17 +885,14 @@ impl Actor {
             };
 
             if let Some(f) = &on_connected {
-                // The pool drops an attempt while it dials when the peer is
-                // closed, or when an adoption takes its place. Its result is
-                // stale then, and the pool closes the connection when it
-                // arrives, so `on_connected` must not hold it open.
+                // The pool dropped the attempt while it dialed. It closes the
+                // connection when the stale result arrives.
                 let Some(permit) = counter.try_get_one() else {
                     return (conn_id, Ok(connection));
                 };
                 let conn_ref = ConnectionRef::new(connection.clone(), permit);
                 if let Err(err) = f(&endpoint, &conn_ref).await {
-                    // The pool never holds a rejected connection. Retire it
-                    // before closing it, as the pool does.
+                    // Retire before closing, as the pool does.
                     counter.retire();
                     close_connection(&connection, CloseReason::Rejected);
                     return (conn_id, Err(err.into()));
@@ -1043,18 +931,13 @@ impl Actor {
                 return;
             }
         };
-        // The peer may have closed the connection while `on_connected` ran.
-        // Making it current would supersede a working connection with a dead
-        // one, and may evict another to make room for it.
+        // The peer may have closed it while `on_connected` ran.
         if connection.close_reason().is_some() {
             debug!(%conn_id, "the connection closed before it was ready");
             self.fail_attempt(conn_id.peer, attempt, e!(PoolConnectError::Closed));
             return;
         }
         // Connections made since this attempt started may have filled the pool.
-        // A connection this one supersedes stays open, so an attempt that
-        // finishes adds one to the connections the pool holds. The exception
-        // is a peer whose superseded connections are at the cap.
         if self.adding_grows(conn_id.peer) && !self.make_room() {
             debug!(%conn_id, "connected, but the pool is full");
             let cause = e!(PoolConnectError::TooManyConnections);
@@ -1073,12 +956,10 @@ impl Actor {
         self.insert_connection(conn, callers);
     }
 
-    /// Retires a failed attempt, and fails its callers with `cause`.
+    /// Retires a failed attempt and fails its callers with `cause`.
     ///
-    /// Requests that joined an adoption want any connection to the peer, not
-    /// this one. So they are handled again, as if they had just come in. They
-    /// get the current connection, wait for another attempt, or start a dial.
-    /// The requests of a dial fail, since the dial was made for them.
+    /// Requests that joined an adoption want any connection, so they are handled
+    /// again. The requests of a dial fail with it.
     fn fail_attempt(
         &mut self,
         id: EndpointId,
@@ -1097,7 +978,6 @@ impl Actor {
         match origin {
             Origin::Dial => fail_waiters(requests, &cause),
             Origin::Incoming(_) => {
-                // A caller that is gone would only start a dial for nobody.
                 for tx in requests.into_iter().filter(|tx| !tx.is_closed()) {
                     self.handle_request(RequestRef { id, tx });
                 }
@@ -1108,15 +988,12 @@ impl Actor {
 
     /// Adds `conn` to the pool and hands it to `waiters`.
     ///
-    /// It becomes the peer's current connection, unless a newer one is current
-    /// already. Then it goes straight to the superseded ones.
+    /// It becomes current, unless a newer connection is current already.
     fn insert_connection(&mut self, conn: PooledConnection, mut waiters: Vec<RefSender>) {
         let conn_id = conn.conn_id();
         let peer = self.peers.entry(conn_id.peer).or_default();
-        // Adoptions can finish out of order, since each runs `on_connected` for
-        // as long as it takes. The connection the peer opened last wins, as it
-        // would have if they had finished in order. A dial never starts while
-        // an adoption runs, so only a newer adoption can be current here.
+        // Adoptions finish out of order, and the one the peer opened last wins.
+        // No dial starts while an adoption runs, so only adoptions compare here.
         let newer_is_current = matches!(
             &peer.current,
             Some(PeerState::Ready(current)) if current.conn_id().generation > conn_id.generation
@@ -1127,19 +1004,13 @@ impl Actor {
         } else {
             match peer.current.take() {
                 Some(PeerState::Ready(previous)) => {
-                    // Two endpoints that dial each other at once each keep the
-                    // connection they saw last. They may disagree, so the peer
-                    // can still be using this one. It closes when it is unused,
-                    // like any other connection the pool holds.
+                    // The peer may still use it, so it stays until unused.
                     debug!(%conn_id, "the new connection supersedes the current one");
                     previous.counter.mark_superseded();
                     peer.superseded.push(previous);
                 }
                 Some(PeerState::Connecting(dial)) => {
-                    // A dial that is still running loses to this connection.
-                    // Its waiters get this one, and its own connection, if it
-                    // has made one, is closed. Its result is discarded when it
-                    // arrives.
+                    // A running dial loses, and its waiters get this connection.
                     debug!(%conn_id, "the new connection serves a running dial");
                     let dial_id = ConnId {
                         peer: conn_id.peer,
@@ -1152,8 +1023,7 @@ impl Actor {
             }
         }
         for tx in waiters {
-            // A caller that is gone takes no reference: it would put the
-            // connection in use and send an unused event when it drops.
+            // A gone caller's reference would only send a spurious unused event.
             if tx.is_closed() {
                 continue;
             }
@@ -1183,11 +1053,7 @@ impl Actor {
         self.close_oldest_superseded(conn_id.peer);
     }
 
-    /// Closes the peer's superseded connections beyond the cap.
-    ///
-    /// A peer that opens connections in a loop would otherwise make the pool
-    /// hold one per attempt, each until it goes unused. The oldest are closed,
-    /// in use or not.
+    /// Closes the peer's oldest superseded connections beyond the cap.
     fn close_oldest_superseded(&mut self, id: EndpointId) {
         loop {
             let Some(peer) = self.peers.get_mut(&id) else {
@@ -1204,10 +1070,6 @@ impl Actor {
     }
 
     /// Handles a connection closing, by us or by the peer.
-    ///
-    /// Only acts if the pool still holds the connection. The event names one
-    /// connection, so an event for one the pool dropped already cannot remove
-    /// another connection to the same peer.
     fn handle_conn_closed(&mut self, conn_id: ConnId) {
         if self.remove_connection(conn_id).is_some() {
             trace!(%conn_id, "connection closed");
@@ -1244,10 +1106,7 @@ impl Actor {
         }
     }
 
-    /// Closes every connection to `id`, and fails the attempts to get one.
-    ///
-    /// Waiters get `cause`, which says whether the pool is shutting down or the
-    /// peer was closed. See [`ConnectionPool::close`].
+    /// Closes every connection to `id`, and fails the attempts with `cause`.
     fn close_peer(&mut self, id: EndpointId, cause: PoolConnectError) {
         let Some(peer) = self.peers.remove(&id) else {
             return;
@@ -1267,8 +1126,6 @@ impl Actor {
             self.release(conn);
         }
         for attempt in attempts {
-            // The connection an attempt has made is closed here. The attempt
-            // runs to its end, and its result is discarded when it arrives.
             if attempt.is_dial() {
                 let dial_id = ConnId {
                     peer: id,
@@ -1328,11 +1185,8 @@ impl ConnectionPool {
 
     /// Returns either a fresh connection or a reference to an existing one.
     ///
-    /// A dial ends within [`Options::connect_timeout`], plus the time
-    /// [`Options::on_connected`] takes. A request for an endpoint the pool is
-    /// adopting a connection from waits for the adoption instead, which only
-    /// `on_connected` bounds. If the adoption fails, the request is handled
-    /// again: it gets the current connection, or a dial.
+    /// If the pool is adopting a connection from the endpoint, this waits for
+    /// the adoption, and falls back to a dial if it fails.
     pub async fn get_or_connect(
         &self,
         id: EndpointId,
@@ -1356,14 +1210,11 @@ impl ConnectionPool {
     /// - [`ConnectionRef::is_superseded`] tells holders of the previous
     ///   connection to move on.
     ///
-    /// If a connection the endpoint opened later became current first, because
-    /// its `on_connected` finished sooner, that one stays current. This one is
-    /// then returned as superseded.
+    /// If a connection the endpoint opened later is current already, this one is
+    /// returned as superseded.
     ///
-    /// The previous connection is not closed right away. Two endpoints that dial
-    /// each other at once each keep the connection they saw last. They may
-    /// disagree, so the remote can still be using the one we superseded. It is
-    /// closed when it is unused instead, like any connection the pool holds.
+    /// The previous connection stays open until it is unused, since the remote
+    /// may still be using it.
     ///
     /// The pool does not check the connection's ALPN.
     ///
@@ -1388,19 +1239,11 @@ impl ConnectionPool {
 
     /// Closes every connection to `id`.
     ///
-    /// That includes connections that [`Self::handle_connection`] superseded,
-    /// even while they are in use. A connection is closed with the reason `drop`
-    /// if it is still in use. Requests waiting for a connection to `id` fail with
-    /// [`PoolConnectError::Closed`]. Requests made after this call get a new
-    /// connection.
+    /// That includes superseded connections, even in use. Requests waiting for
+    /// a connection to `id` fail with [`PoolConnectError::Closed`].
     ///
-    /// An adoption that is still running has its connection closed right here.
-    /// A dial that is still running does not: its connection only exists
-    /// inside the dial. Its result is discarded when it arrives, and the
-    /// connection is closed then. A dial that is still connecting skips
-    /// [`Options::on_connected`], so this happens within
-    /// [`Options::connect_timeout`]. A dial whose `on_connected` is running
-    /// is closed once the callback returns.
+    /// A running dial's connection is closed once the dial ends, after
+    /// [`Options::on_connected`] if that is already running.
     pub async fn close(&self, id: EndpointId) -> std::result::Result<(), ConnectionPoolError> {
         self.tx
             .send(ActorMessage::ConnectionShutdown { id })
@@ -1414,9 +1257,8 @@ impl ConnectionPool {
 struct ConnectionCounterInner {
     /// The reference count, with the [`RETIRED`] bit.
     ///
-    /// The count and the bit share one atomic. Thus retiring an unused
-    /// connection and upgrading a reference to it cannot both succeed: the
-    /// first update wins.
+    /// One atomic, so retiring an unused connection and upgrading it exclude
+    /// each other.
     state: AtomicU64,
     /// Which connection this counts, which its unused events name.
     conn_id: ConnId,
@@ -1457,24 +1299,14 @@ impl ConnectionCounterInner {
     }
 }
 
-/// Bit that marks a connection the pool no longer holds.
-///
-/// It is the high bit of [`ConnectionCounterInner::state`]. The bits below it
-/// hold the count. See [`ConnectionCounter`] for when it is set.
+/// The bit of [`ConnectionCounterInner::state`] that marks a connection the pool no longer holds.
 const RETIRED: u64 = 1 << 63;
 
 /// The pool's hold on a connection's reference count, which retires it on drop.
 ///
-/// It is not `Clone`: the pool keeps one for each connection it holds or is
-/// making. Thus a counter is retired when the pool stops holding its
-/// connection, and [`WeakConnectionRef::upgrade`] needs to check nothing else.
-/// The one other retirement is a connection that `on_connected` rejected,
-/// which the pool never holds. Where the pool closes a connection, it drops
-/// the counter first, so no upgrade succeeds on a connection that the pool
-/// closed.
-///
-/// Weak references and the connect future hold the [`ConnectionCounterInner`]
-/// instead.
+/// It is not `Clone`: the pool keeps one per connection it holds or is making,
+/// so the counter retires exactly when the pool lets go. Weak references and
+/// the connect future share the [`ConnectionCounterInner`].
 #[derive(Debug)]
 struct ConnectionCounter {
     inner: Arc<ConnectionCounterInner>,
@@ -1516,10 +1348,6 @@ impl ConnectionCounter {
     }
 
     /// Retires an unused connection, and returns whether it was unused.
-    ///
-    /// If it returns `true`, the caller removes the connection and closes it.
-    /// If it returns `false`, a reference was taken in the meantime, and the
-    /// pool keeps the connection.
     fn try_retire_unused(&self) -> bool {
         self.inner
             .state
@@ -1554,8 +1382,7 @@ impl OneConnection {
 
 impl Clone for OneConnection {
     fn clone(&self) -> Self {
-        // The count is at least one while `self` lives, so a clone never takes
-        // a connection off the unused list behind the pool's back.
+        // No retirement check: the count is at least one while `self` lives.
         self.inner.state.fetch_add(1, Ordering::AcqRel);
         Self {
             inner: self.inner.clone(),
