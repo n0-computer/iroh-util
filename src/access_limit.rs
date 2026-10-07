@@ -15,13 +15,13 @@ use n0_error::e;
 ///
 /// Any refused connection will be closed with an error code of `0` and reason `not allowed`.
 #[derive(derive_more::Debug, Clone)]
-pub struct AccessLimit<P: ProtocolHandler + Clone> {
+pub struct AccessLimit<P> {
     proto: P,
     #[debug("limiter")]
     limiter: Arc<dyn Fn(EndpointId) -> bool + Send + Sync + 'static>,
 }
 
-impl<P: ProtocolHandler + Clone> AccessLimit<P> {
+impl<P> AccessLimit<P> {
     /// Create a new `AccessLimit`.
     ///
     /// The function should return `true` for endpoints that are allowed to
@@ -37,7 +37,7 @@ impl<P: ProtocolHandler + Clone> AccessLimit<P> {
     }
 }
 
-impl<P: ProtocolHandler + Clone> ProtocolHandler for AccessLimit<P> {
+impl<P: ProtocolHandler> ProtocolHandler for AccessLimit<P> {
     fn on_accepting(
         &self,
         accepting: Accepting,
