@@ -1,10 +1,13 @@
-//! A simple iroh connection pool
+//! A simple iroh connection pool.
 //!
 //! Entry point is [`ConnectionPool`]. You create a connection pool for a specific
 //! ALPN and [`Options`]. Then the pool will manage connections for you.
 //!
 //! Access to connections is via the [`ConnectionPool::get_or_connect`] method, which
 //! gives you access to a connection via a [`ConnectionRef`] if possible.
+//! Connections the remote opened can be handed to the pool with
+//! [`ConnectionPool::handle_connection`]. A protocol that both dials and
+//! accepts then uses one connection per endpoint for both.
 //!
 //! It is important that you keep the [`ConnectionRef`] alive while you are using
 //! the connection.
@@ -17,13 +20,13 @@ use std::{
     ops::Deref,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
 use iroh::{
     Endpoint, EndpointId,
-    endpoint::{ConnectError, Connection},
+    endpoint::{ConnectError, Connection, Side, VarInt},
 };
 use n0_error::{e, stack_error};
 use n0_future::{
@@ -32,32 +35,60 @@ use n0_future::{
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info, trace};
+use tracing::{debug, trace};
 
-pub type OnConnected =
-    Arc<dyn Fn(&Endpoint, &Connection) -> n0_future::future::Boxed<io::Result<()>> + Send + Sync>;
+/// A callback that runs for each new connection.
+///
+/// See [`Options::on_connected`].
+pub type OnConnected = Arc<
+    dyn Fn(&Endpoint, &ConnectionRef) -> n0_future::future::Boxed<io::Result<()>> + Send + Sync,
+>;
 
 /// The pool is a single actor, so we can afford a larger inbox.
 const INBOX_CAPACITY: usize = 1024;
 
-/// Configuration options for the connection pool
+/// Configuration options for the connection pool.
+///
+/// Start from [`Options::default`] and set the fields you need.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use iroh_util::connection_pool::Options;
+///
+/// let mut options = Options::default();
+/// options.idle_timeout = Duration::from_secs(30);
+/// ```
 #[derive(derive_more::Debug, Clone)]
+#[non_exhaustive]
 pub struct Options {
     /// How long to keep unused connections around.
     ///
-    /// Idle here means that there are no [`ConnectionRef`]s alive for the connection,
-    /// not that the connection itself is idle.
+    /// Unused means that there are no [`ConnectionRef`]s alive for the connection,
+    /// not that no data flows on it.
     pub idle_timeout: Duration,
-    /// Timeout for connect. This includes the time spent in on_connect, if set.
+    /// Timeout for the dial. [`Options::on_connected`] runs after it.
     pub connect_timeout: Duration,
-    /// Maximum number of connections to hand out.
+    /// Maximum number of connections the pool holds, superseded ones included.
     ///
-    /// Attempts to connect that are still running do not count, so attempts to
-    /// peers that do not answer cannot take the place of connections.
+    /// Running attempts do not count, so peers that do not answer cannot fill
+    /// the pool.
     pub max_connections: usize,
-    /// An optional callback that can be used to wait for the connection to enter some state.
-    /// An example usage could be to wait for the connection to become direct before handing
-    /// it out to the user.
+    /// Maximum number of superseded connections to keep per peer.
+    ///
+    /// Beyond this many, the oldest are closed, even if in use.
+    pub max_superseded_per_peer: usize,
+    /// An optional callback that runs before the pool hands out a new connection.
+    ///
+    /// Use it to wait for the connection to reach some state, such as a direct
+    /// path. It runs for dialed and adopted connections alike, which
+    /// [`Connection::side`] tells apart. It runs on the pool's task and must
+    /// not block. No timeout bounds it, and requests wait for it.
+    ///
+    /// A [`ConnectionRef`] kept past the callback keeps the connection in use,
+    /// so the pool never closes it. Keep a [`WeakConnectionRef`] instead.
     #[debug(skip)]
     pub on_connected: Option<OnConnected>,
 }
@@ -68,16 +99,17 @@ impl Default for Options {
             idle_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(1),
             max_connections: 1024,
+            max_superseded_per_peer: 2,
             on_connected: None,
         }
     }
 }
 
 impl Options {
-    /// Set the on_connected callback
+    /// Sets the [`Options::on_connected`] callback.
     pub fn with_on_connected<F, Fut>(mut self, f: F) -> Self
     where
-        F: Fn(Endpoint, Connection) -> Fut + Send + Sync + 'static,
+        F: Fn(Endpoint, ConnectionRef) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = io::Result<()>> + Send + 'static,
     {
         self.on_connected = Some(Arc::new(move |ep, conn| {
@@ -90,14 +122,17 @@ impl Options {
 }
 
 /// A reference to a connection that is owned by a connection pool.
-#[derive(Debug)]
+///
+/// The connection counts as in use for as long as any reference to it is alive.
+/// Each clone counts, like an `Arc`.
+#[derive(Debug, Clone)]
 pub struct ConnectionRef {
-    connection: iroh::endpoint::Connection,
-    _permit: OneConnection,
+    connection: Connection,
+    permit: OneConnection,
 }
 
 impl Deref for ConnectionRef {
-    type Target = iroh::endpoint::Connection;
+    type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
         &self.connection
@@ -105,36 +140,94 @@ impl Deref for ConnectionRef {
 }
 
 impl ConnectionRef {
-    fn new(connection: iroh::endpoint::Connection, permit: OneConnection) -> Self {
-        Self {
-            connection,
-            _permit: permit,
+    fn new(connection: Connection, permit: OneConnection) -> Self {
+        Self { connection, permit }
+    }
+
+    /// Returns whether a newer connection to the same endpoint superseded this one.
+    ///
+    /// A superseded connection stays open while in use, but new work should use
+    /// the one [`ConnectionPool::get_or_connect`] returns.
+    pub fn is_superseded(&self) -> bool {
+        self.permit.is_superseded()
+    }
+
+    /// Returns a reference to the connection that does not keep it in use.
+    ///
+    /// See [`WeakConnectionRef`].
+    pub fn downgrade(&self) -> WeakConnectionRef {
+        WeakConnectionRef {
+            connection: self.connection.clone(),
+            counter: self.permit.inner.clone(),
         }
     }
 }
 
-/// Error when a connection can not be acquired
+/// A reference to a pooled connection that does not keep it in use.
+///
+/// It relates to [`ConnectionRef`] as `Weak` does to `Arc`: [`Self::upgrade`]
+/// returns a counting reference while the pool holds the connection. Unlike
+/// `Weak`, it keeps the connection handle alive and derefs to it.
+///
+/// Use it in tasks that only watch the connection, such as an accept loop, and
+/// upgrade before serving a stream. The deref does not count as a use, so the
+/// pool can close the connection while you use it that way.
+#[derive(Debug, Clone)]
+pub struct WeakConnectionRef {
+    connection: Connection,
+    counter: Arc<ConnectionCounterInner>,
+}
+
+impl Deref for WeakConnectionRef {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl WeakConnectionRef {
+    /// Returns a reference that keeps the connection in use, if the pool holds it.
+    ///
+    /// The pool holds a connection the remote closed until it handles the close
+    /// event, so the reference may already be closed.
+    pub fn upgrade(&self) -> Option<ConnectionRef> {
+        let permit = self.counter.try_get_one()?;
+        Some(ConnectionRef::new(self.connection.clone(), permit))
+    }
+
+    /// Returns whether a newer connection to the same endpoint superseded this one.
+    ///
+    /// See [`ConnectionRef::is_superseded`].
+    pub fn is_superseded(&self) -> bool {
+        self.counter.is_superseded()
+    }
+}
+
+/// An error returned when the pool cannot get a connection.
 ///
 /// This includes the normal iroh connection errors as well as pool specific
 /// errors such as timeouts and connection limits.
 #[stack_error(derive, add_meta)]
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum PoolConnectError {
-    /// Connection pool is shut down
+    /// The connection pool is shut down.
     #[error("Connection pool is shut down")]
     Shutdown {},
+    /// The connection or its endpoint was closed before the pool handed it out.
     #[error("Connection was closed")]
     Closed {},
-    /// Timeout during connect
+    /// The dial did not finish within [`Options::connect_timeout`].
     #[error("Timeout during connect")]
     Timeout {},
-    /// Too many connections
+    /// The pool was full when the attempt finished.
     #[error("Too many connections")]
     TooManyConnections {},
-    /// Error during connect
+    /// The dial failed.
     #[error(transparent)]
     ConnectError { source: Arc<ConnectError> },
-    /// Error during on_connect callback
+    /// [`Options::on_connected`] failed.
     #[error(transparent)]
     OnConnectError {
         #[error(std_err)]
@@ -159,19 +252,22 @@ impl From<io::Error> for PoolConnectError {
 /// The only thing that can go wrong is that the connection pool is shut down.
 #[stack_error(derive, add_meta)]
 pub enum ConnectionPoolError {
-    /// The connection pool has been shut down
+    /// The connection pool has been shut down.
     #[error("The connection pool has been shut down")]
     Shutdown {},
 }
 
+type RefSender = oneshot::Sender<Result<ConnectionRef, PoolConnectError>>;
+
 enum ActorMessage {
     RequestRef(RequestRef),
+    HandleConnection { conn: Connection, tx: RefSender },
     ConnectionShutdown { id: EndpointId },
 }
 
 struct RequestRef {
     id: EndpointId,
-    tx: oneshot::Sender<Result<ConnectionRef, PoolConnectError>>,
+    tx: RefSender,
 }
 
 /// Which attempt to a peer made a connection.
@@ -203,21 +299,210 @@ impl fmt::Display for ConnId {
     }
 }
 
-/// State for a peer in the connection pool
-enum PeerState {
-    /// We are currently connecting to this peer.
-    Connecting {
-        generation: Generation,
-        /// Waiters that need to be notified when the connection is established or fails.
-        waiters: Vec<oneshot::Sender<Result<ConnectionRef, PoolConnectError>>>,
-    },
-    /// We have a connection to the peer.
-    Ready {
-        /// The generation of the attempt that made the connection.
-        generation: Generation,
-        connection: Connection,
-        counter: ConnectionCounter,
-    },
+/// Reasons for which the pool may close a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseReason {
+    /// Nothing used it when the pool closed it.
+    Unused,
+    /// It was in use when [`ConnectionPool::close`] or shutdown closed it.
+    Dropped,
+    /// A newer connection to the peer took its place.
+    Superseded,
+    /// The pool was full when the attempt that made it finished.
+    TooManyConnections,
+    /// [`Options::on_connected`] failed.
+    Rejected,
+    /// The peer was closed while the attempt that made it was running.
+    Closed,
+}
+
+impl CloseReason {
+    /// Returns the error code the pool closes with.
+    fn code(self) -> VarInt {
+        VarInt::from_u32(0)
+    }
+
+    /// Returns the reason the pool closes with, which the peer can read.
+    fn reason(self) -> &'static [u8] {
+        match self {
+            Self::Unused => b"unused",
+            Self::Dropped => b"drop",
+            Self::Superseded => b"superseded",
+            Self::TooManyConnections => b"too many connections",
+            Self::Rejected => b"rejected",
+            Self::Closed => b"closed",
+        }
+    }
+}
+
+/// Closes `connection`, telling the peer why.
+fn close_connection(connection: &Connection, reason: CloseReason) {
+    connection.close(reason.code(), reason.reason());
+}
+
+/// A connection the pool holds, with its reference count.
+///
+/// It is not `Clone`, since dropping it retires the counter.
+#[derive(Debug)]
+struct PooledConnection {
+    connection: Connection,
+    counter: ConnectionCounter,
+}
+
+impl PooledConnection {
+    fn new(connection: Connection, counter: ConnectionCounter) -> Self {
+        Self {
+            connection,
+            counter,
+        }
+    }
+
+    fn conn_id(&self) -> ConnId {
+        self.counter.conn_id()
+    }
+
+    fn conn_ref(&self) -> ConnectionRef {
+        ConnectionRef::new(self.connection.clone(), self.counter.get_one())
+    }
+
+    fn is_unused(&self) -> bool {
+        self.counter.is_unused()
+    }
+
+    fn close(self) {
+        let reason = if self.is_unused() {
+            CloseReason::Unused
+        } else {
+            CloseReason::Dropped
+        };
+        self.close_as(reason);
+    }
+
+    /// Retires the connection, then closes it, so no upgrade sees it closed.
+    fn close_as(self, reason: CloseReason) {
+        let Self {
+            connection,
+            counter,
+        } = self;
+        drop(counter);
+        close_connection(&connection, reason);
+    }
+}
+
+/// An attempt to get a connection to a peer: a dial, or an adoption.
+#[derive(Debug)]
+struct PendingConnection {
+    counter: ConnectionCounter,
+    origin: Origin,
+    /// Callers of [`ConnectionPool::handle_connection`] for this connection.
+    callers: Vec<RefSender>,
+    /// Callers of [`ConnectionPool::get_or_connect`], which want any connection.
+    requests: Vec<RefSender>,
+}
+
+/// Where a pending connection comes from.
+#[derive(Debug)]
+enum Origin {
+    /// The connection exists only once the dial ends.
+    Dial,
+    /// The peer opened the connection, and the pool is adopting it.
+    Incoming(Connection),
+}
+
+impl PendingConnection {
+    /// Returns the connection, if the attempt has one already.
+    fn connection(&self) -> Option<&Connection> {
+        match &self.origin {
+            Origin::Dial => None,
+            Origin::Incoming(connection) => Some(connection),
+        }
+    }
+
+    /// Retires the attempt and closes its connection, if any, returning the waiters.
+    fn close_as(self, reason: CloseReason) -> Vec<RefSender> {
+        let Self {
+            counter,
+            origin,
+            mut callers,
+            requests,
+            ..
+        } = self;
+        drop(counter);
+        if let Origin::Incoming(connection) = origin {
+            close_connection(&connection, reason);
+        }
+        callers.extend(requests);
+        callers
+    }
+}
+
+fn fail_waiters(waiters: Vec<RefSender>, cause: &PoolConnectError) {
+    for tx in waiters {
+        let _ = tx.send(Err(cause.clone()));
+    }
+}
+
+/// Everything the pool holds for one peer.
+#[derive(Debug, Default)]
+struct Peer {
+    /// The connection requests get.
+    current: Option<PooledConnection>,
+    /// Dials and adoptions that are running, oldest first.
+    attempts: Vec<PendingConnection>,
+    /// Connections that a newer one took the place of, oldest first.
+    superseded: Vec<PooledConnection>,
+}
+
+impl Peer {
+    fn is_empty(&self) -> bool {
+        self.current.is_none() && self.attempts.is_empty() && self.superseded.is_empty()
+    }
+
+    /// Returns the connection with `conn_id`, current or superseded.
+    fn connection(&self, conn_id: ConnId) -> Option<&PooledConnection> {
+        self.current
+            .iter()
+            .chain(&self.superseded)
+            .find(|conn| conn.conn_id() == conn_id)
+    }
+
+    /// Returns the pooled connection with the same stable id as `connection`.
+    fn find_by_connection(&self, connection: &Connection) -> Option<&PooledConnection> {
+        self.current
+            .iter()
+            .chain(&self.superseded)
+            .find(|conn| conn.connection.stable_id() == connection.stable_id())
+    }
+
+    /// Returns the adoption of `connection` that is running, if there is one.
+    fn adoption_mut(&mut self, connection: &Connection) -> Option<&mut PendingConnection> {
+        self.attempts.iter_mut().find(|attempt| {
+            attempt
+                .connection()
+                .is_some_and(|incoming| incoming.stable_id() == connection.stable_id())
+        })
+    }
+
+    /// Removes the connection with `conn_id`, current or superseded.
+    fn remove_connection(&mut self, conn_id: ConnId) -> Option<PooledConnection> {
+        if let Some(conn) = self.current.take_if(|conn| conn.conn_id() == conn_id) {
+            return Some(conn);
+        }
+        let index = self
+            .superseded
+            .iter()
+            .position(|conn| conn.conn_id() == conn_id)?;
+        Some(self.superseded.remove(index))
+    }
+
+    /// Removes the attempt that makes the connection `conn_id`.
+    fn remove_attempt(&mut self, conn_id: ConnId) -> Option<PendingConnection> {
+        let index = self
+            .attempts
+            .iter()
+            .position(|attempt| attempt.counter.conn_id() == conn_id)?;
+        Some(self.attempts.remove(index))
+    }
 }
 
 /// The connections nothing uses, in the order they went unused.
@@ -271,10 +556,11 @@ impl UnusedSet {
     }
 }
 
+/// The result of an attempt: a dial, or adopting an incoming connection.
 type ConnectResult = (ConnId, Result<Connection, PoolConnectError>);
 
 struct Actor {
-    /// Inbox
+    /// The inbox for requests from [`ConnectionPool`] handles.
     rx: mpsc::Receiver<ActorMessage>,
     /// Separate inbox for unused events, gets processed before the main inbox.
     ///
@@ -282,21 +568,20 @@ struct Actor {
     unused_rx: mpsc::UnboundedReceiver<ConnId>,
     /// Sender for the unused inbox to be cloned into the connection counter.
     ///
-    /// This is unbounded so it can be used in Drop, but it is bounded by the number
-    /// of ConnectionRefs we give out, which is bounded by max_connections.
+    /// Unbounded, so that `Drop` can send.
     unused_tx: mpsc::UnboundedSender<ConnId>,
     options: Options,
     endpoint: Endpoint,
     alpn: Arc<[u8]>,
-    peers: HashMap<EndpointId, PeerState>,
+    peers: HashMap<EndpointId, Peer>,
+    /// Currently unused connections, in order of when they became unused.
+    unused: UnusedSet,
     /// Futures for currently connecting peers.
     connecting: FuturesUnordered<Boxed<ConnectResult>>,
     /// Generation counter used to distinguish between connection attempts to the same peer.
     next_generation: Generation,
     /// Futures for connection close watchers, each yielding which connection closed.
     conn_close: FuturesUnordered<Boxed<ConnId>>,
-    /// Currently unused connections, in order of when they became unused.
-    unused: UnusedSet,
 }
 
 impl Actor {
@@ -316,10 +601,10 @@ impl Actor {
                 endpoint,
                 alpn: alpn.to_vec().into(),
                 peers: HashMap::new(),
-                connecting: FuturesUnordered::new(),
-                next_generation: Generation(0),
-                conn_close: FuturesUnordered::new(),
                 unused: UnusedSet::default(),
+                connecting: FuturesUnordered::new(),
+                conn_close: FuturesUnordered::new(),
+                next_generation: Generation(0),
             },
             tx,
         )
@@ -331,8 +616,8 @@ impl Actor {
         loop {
             let next_unused_timer_at = match self.unused.oldest() {
                 None => MaybeFuture::None,
-                Some(unused_since) => {
-                    let deadline = unused_since + self.options.idle_timeout;
+                Some(since) => {
+                    let deadline = since + self.options.idle_timeout;
                     MaybeFuture::Some(n0_future::time::sleep_until(deadline))
                 }
             };
@@ -361,91 +646,149 @@ impl Actor {
             }
         }
 
-        // Notify waiters during shutdown and close connections.
-        for (_, state) in self.peers.drain() {
-            match state {
-                PeerState::Connecting { waiters, .. } => {
-                    for tx in waiters {
-                        let _ = tx.send(Err(e!(PoolConnectError::Shutdown)));
-                    }
-                }
-                PeerState::Ready {
-                    connection,
-                    counter,
-                    ..
-                } => {
-                    let reason: &[u8] = if counter.is_unused() {
-                        b"unused"
-                    } else {
-                        b"drop"
-                    };
-                    connection.close(0u32.into(), reason);
-                }
-            }
+        for id in self.peers.keys().copied().collect::<Vec<_>>() {
+            self.close_peer(id, e!(PoolConnectError::Shutdown));
         }
     }
 
     fn handle_msg(&mut self, msg: ActorMessage) {
         match msg {
             ActorMessage::RequestRef(req) => self.handle_request(req),
+            ActorMessage::HandleConnection { conn, tx } => self.handle_incoming(conn, tx),
             ActorMessage::ConnectionShutdown { id } => {
                 trace!(%id, "shutdown requested");
-                self.remove_peer(id);
+                self.close_peer(id, e!(PoolConnectError::Closed));
             }
         }
     }
 
+    /// Hands out a reference to the peer's connection, making one if needed.
     fn handle_request(&mut self, req: RequestRef) {
-        let id = req.id;
+        let RequestRef { id, tx } = req;
         // A connection that closed a moment ago is still the peer's current one
         // until its close event reaches the actor. Handing it out would give the
         // caller a connection that fails on first use.
-        if let Some(PeerState::Ready { connection, .. }) = self.peers.get(&id)
-            && connection.close_reason().is_some()
+        if let Some(conn_id) = self
+            .ready(id)
+            .filter(|conn| conn.connection.close_reason().is_some())
+            .map(PooledConnection::conn_id)
         {
             debug!(%id, "current connection has closed, dialing again");
-            self.remove_peer(id);
+            self.remove_connection(conn_id);
         }
-        if let Some(state) = self.peers.get_mut(&id) {
-            match state {
-                PeerState::Connecting { waiters, .. } => {
-                    waiters.push(req.tx);
-                    return;
-                }
-                PeerState::Ready {
-                    generation,
-                    connection,
-                    counter,
-                } => {
-                    self.unused.remove(ConnId {
-                        peer: id,
-                        generation: *generation,
-                    });
-                    let one = counter.get_one();
-                    info!(%id, "Handing out ConnectionRef {}", counter.current());
-                    let _ = req.tx.send(Ok(ConnectionRef::new(connection.clone(), one)));
-                    return;
-                }
-            }
-        }
-
-        if !self.make_room() {
-            let _ = req.tx.send(Err(e!(PoolConnectError::TooManyConnections)));
+        if let Some(conn) = self.ready(id) {
+            debug!(%id, count = conn.counter.current(), "handing out a ConnectionRef");
+            let conn_id = conn.conn_id();
+            let conn_ref = conn.conn_ref();
+            self.unused.remove(conn_id);
+            let _ = tx.send(Ok(conn_ref));
             return;
         }
+        // Requests join the newest attempt. Whichever attempt finishes first
+        // serves them all.
+        if let Some(attempt) = self
+            .peers
+            .get_mut(&id)
+            .and_then(|peer| peer.attempts.last_mut())
+        {
+            attempt.requests.retain(|tx| !tx.is_closed());
+            attempt.requests.push(tx);
+            return;
+        }
+        // Whether there is room is decided when the attempt finishes. What the
+        // pool holds may have changed by then, and only then is there a
+        // connection to evict for.
+        self.start_attempt(id, None, tx);
+    }
 
+    /// Starts adopting a connection the peer opened.
+    ///
+    /// See [`ConnectionPool::handle_connection`].
+    fn handle_incoming(&mut self, conn: Connection, tx: RefSender) {
+        let id = conn.remote_id();
+        if conn.close_reason().is_some() {
+            let _ = tx.send(Err(e!(PoolConnectError::Closed)));
+            return;
+        }
+        // Adopting a connection twice would give it two counters, and closing
+        // one would close the connection the other still hands out.
+        if let Some(pooled) = self
+            .peers
+            .get(&id)
+            .and_then(|peer| peer.find_by_connection(&conn))
+        {
+            let conn_id = pooled.conn_id();
+            let conn_ref = pooled.conn_ref();
+            self.unused.remove(conn_id);
+            let _ = tx.send(Ok(conn_ref));
+            return;
+        }
+        if let Some(attempt) = self
+            .peers
+            .get_mut(&id)
+            .and_then(|peer| peer.adoption_mut(&conn))
+        {
+            attempt.callers.retain(|tx| !tx.is_closed());
+            attempt.callers.push(tx);
+            return;
+        }
+        self.start_attempt(id, Some(conn), tx);
+    }
+
+    /// Starts a dial, or the adoption of `incoming`.
+    fn start_attempt(&mut self, id: EndpointId, incoming: Option<Connection>, tx: RefSender) {
         let conn_id = ConnId {
             peer: id,
             generation: self.next_generation.next(),
         };
-        self.peers.insert(
-            id,
-            PeerState::Connecting {
-                generation: conn_id.generation,
-                waiters: vec![req.tx],
-            },
-        );
-        self.connecting.push(self.make_connect_future(conn_id));
+        let counter = ConnectionCounter::new(conn_id, self.unused_tx.clone());
+        let shared = counter.shared();
+        let origin = match &incoming {
+            Some(connection) => Origin::Incoming(connection.clone()),
+            None => Origin::Dial,
+        };
+        let (callers, requests) = match origin {
+            Origin::Dial => (Vec::new(), vec![tx]),
+            Origin::Incoming(_) => (vec![tx], Vec::new()),
+        };
+        let pending = PendingConnection {
+            counter,
+            origin,
+            callers,
+            requests,
+        };
+        self.peers.entry(id).or_default().attempts.push(pending);
+        self.connecting
+            .push(self.make_connect_future(conn_id, shared, incoming));
+    }
+
+    /// Returns the peer's current connection.
+    fn ready(&self, id: EndpointId) -> Option<&PooledConnection> {
+        self.peers.get(&id).and_then(|peer| peer.current.as_ref())
+    }
+
+    /// Returns the connection with `conn_id`, current or superseded.
+    fn connection(&self, conn_id: ConnId) -> Option<&PooledConnection> {
+        self.peers
+            .get(&conn_id.peer)
+            .and_then(|peer| peer.connection(conn_id))
+    }
+
+    /// Returns the number of connections the pool holds, current and superseded.
+    fn connection_count(&self) -> usize {
+        self.peers
+            .values()
+            .map(|peer| usize::from(peer.current.is_some()) + peer.superseded.len())
+            .sum()
+    }
+
+    /// Returns whether adding a connection to the peer grows the pool.
+    ///
+    /// At [`Options::max_superseded_per_peer`], the cap closes one as it adds one.
+    fn adding_grows(&self, id: EndpointId) -> bool {
+        self.peers.get(&id).is_none_or(|peer| {
+            peer.current.is_none() || peer.superseded.len() < self.options.max_superseded_per_peer
+        })
     }
 
     /// Makes room for one more connection if the pool holds `max_connections`.
@@ -453,228 +796,329 @@ impl Actor {
     /// Evicts the connection that has been unused the longest, and returns
     /// `false` if there is none.
     fn make_room(&mut self) -> bool {
-        let connections = self
-            .peers
-            .values()
-            .filter(|state| matches!(state, PeerState::Ready { .. }))
-            .count();
-        if connections < self.options.max_connections {
-            return true;
+        while self.connection_count() >= self.options.max_connections {
+            let Some(conn_id) = self.unused.pop_oldest() else {
+                return false;
+            };
+            let Some(conn) = self.take_unused(conn_id) else {
+                continue;
+            };
+            debug!(%conn_id, "evicting the connection unused longest to make room");
+            conn.close_as(CloseReason::Unused);
         }
-        let Some(conn_id) = self.unused.pop_oldest() else {
-            return false;
-        };
-        debug_assert!(
-            matches!(
-                self.peers.get(&conn_id.peer),
-                Some(PeerState::Ready { generation, counter, .. })
-                    if *generation == conn_id.generation && counter.is_unused()
-            ),
-            "the unused list names a connection that is not unused"
-        );
-        trace!(%conn_id, "evicting oldest unused peer to make room");
-        self.remove_peer(conn_id.peer);
         true
     }
 
-    fn make_connect_future(&self, conn_id: ConnId) -> Boxed<ConnectResult> {
+    /// Stops holding the connection if it is still unused, and returns it.
+    ///
+    /// A connection on the unused list may be in use again, through an upgrade
+    /// that did not go through the pool. Its next drop to zero lists it again.
+    fn take_unused(&mut self, conn_id: ConnId) -> Option<PooledConnection> {
+        if !self.connection(conn_id)?.counter.try_retire_unused() {
+            return None;
+        }
+        self.remove_connection(conn_id)
+    }
+
+    /// Returns a future that dials the peer or adopts `incoming`, then runs `on_connected`.
+    fn make_connect_future(
+        &self,
+        conn_id: ConnId,
+        counter: Arc<ConnectionCounterInner>,
+        incoming: Option<Connection>,
+    ) -> Boxed<ConnectResult> {
         let endpoint = self.endpoint.clone();
         let alpn = self.alpn.clone();
         let on_connected = self.options.on_connected.clone();
         let connect_timeout = self.options.connect_timeout;
         Box::pin(async move {
-            let mut connected = None;
-            let attempt = async {
-                let conn = endpoint
-                    .connect(conn_id.peer, &alpn[..])
+            let connected = if let Some(incoming) = incoming {
+                Ok(incoming)
+            } else {
+                n0_future::time::timeout(connect_timeout, endpoint.connect(conn_id.peer, &alpn[..]))
                     .await
-                    .map_err(PoolConnectError::from)?;
-                connected = Some(conn.clone());
-                if let Some(f) = &on_connected {
-                    f(&endpoint, &conn).await.map_err(PoolConnectError::from)?;
+                    .map_err(|_| e!(PoolConnectError::Timeout))
+                    .and_then(|res| res.map_err(PoolConnectError::from))
+            };
+
+            let connection = match connected {
+                Err(err) => return (conn_id, Err(err)),
+                Ok(connection) => connection,
+            };
+
+            if let Some(f) = &on_connected {
+                // The pool dropped the attempt while it dialed. It closes the
+                // connection when the stale result arrives.
+                let Some(permit) = counter.try_get_one() else {
+                    return (conn_id, Ok(connection));
+                };
+                let conn_ref = ConnectionRef::new(connection.clone(), permit);
+                if let Err(err) = f(&endpoint, &conn_ref).await {
+                    // Retire before closing, as the pool does.
+                    counter.retire();
+                    close_connection(&connection, CloseReason::Rejected);
+                    return (conn_id, Err(err.into()));
                 }
-                Result::<Connection, PoolConnectError>::Ok(conn)
-            };
-            let result = match n0_future::time::timeout(connect_timeout, attempt).await {
-                Ok(r) => r,
-                Err(_) => Err(e!(PoolConnectError::Timeout)),
-            };
-            // `on_connected` failed or ran out of time. Close the connection
-            // rather than drop it: the callback may have handed it to a task.
-            if result.is_err()
-                && let Some(conn) = connected
-            {
-                conn.close(0u32.into(), b"on_connected failed");
             }
-            (conn_id, result)
+
+            (conn_id, Ok(connection))
         })
     }
 
+    /// Makes the connection an attempt produced the peer's current one.
     fn handle_connect_result(
         &mut self,
         conn_id: ConnId,
         result: Result<Connection, PoolConnectError>,
     ) {
-        let ConnId {
-            peer: id,
-            generation,
-        } = conn_id;
-        let current = matches!(
-            self.peers.get(&id),
-            Some(PeerState::Connecting { generation: g, .. }) if *g == generation
-        );
-        if !current {
-            // PeerState was removed or changed in the meantime, discard the connection.
-            debug!(%id, "stale connect result, discarding");
-            if let Ok(conn) = result {
-                conn.close(0u32.into(), b"discarded");
+        let Some(attempt) = self
+            .peers
+            .get_mut(&conn_id.peer)
+            .and_then(|peer| peer.remove_attempt(conn_id))
+        else {
+            // Only `close` and shutdown drop an attempt. An adoption's
+            // connection was closed then, and a dial's is closed now.
+            debug!(%conn_id, "stale connect result, discarding");
+            if let Ok(connection) = result {
+                close_connection(&connection, CloseReason::Closed);
             }
-            return;
-        }
-        let Some(PeerState::Connecting { waiters, .. }) = self.peers.remove(&id) else {
             return;
         };
-        match result {
-            // Connections made since this attempt started may have filled the pool.
-            Ok(conn) if !self.make_room() => {
-                debug!(%id, "connected, but the pool is full");
-                conn.close(0u32.into(), b"too many connections");
-                for tx in waiters {
-                    let _ = tx.send(Err(e!(PoolConnectError::TooManyConnections)));
-                }
-            }
-            Ok(conn) => {
-                let counter = ConnectionCounter::new(conn_id, self.unused_tx.clone());
-                for tx in waiters {
-                    if tx.is_closed() {
-                        continue;
-                    }
-                    let permit = counter.get_one();
-                    if tx
-                        .send(Ok(ConnectionRef::new(conn.clone(), permit)))
-                        .is_err()
-                    {
-                        // User is no longer interested in the ConnectionRef.
-                    }
-                }
-                info!(%id, "connected, {} ref(s) outstanding", counter.current());
-
-                // Create a future that waits for the connection to close.
-                let close_fut: Boxed<ConnId> = {
-                    let conn = conn.clone();
-                    Box::pin(async move {
-                        conn.closed().await;
-                        conn_id
-                    })
-                };
-                self.conn_close.push(close_fut);
-
-                if counter.is_unused() {
-                    self.unused.insert(conn_id, Instant::now());
-                }
-                self.peers.insert(
-                    id,
-                    PeerState::Ready {
-                        generation,
-                        connection: conn,
-                        counter,
-                    },
-                );
-            }
+        let connection = match result {
+            Ok(connection) => connection,
             Err(cause) => {
-                debug!(%id, "connect failed: {cause:?}");
-                for tx in waiters {
-                    let _ = tx.send(Err(cause.clone()));
-                }
+                debug!(%conn_id, "attempt failed: {cause:?}");
+                self.fail_attempt(conn_id.peer, attempt, cause);
+                return;
             }
+        };
+        // The peer may have closed it while `on_connected` ran.
+        if connection.close_reason().is_some() {
+            debug!(%conn_id, "the connection closed before it was ready");
+            self.fail_attempt(conn_id.peer, attempt, e!(PoolConnectError::Closed));
+            return;
+        }
+        // Connections made since this attempt started may have filled the pool.
+        if self.adding_grows(conn_id.peer) && !self.make_room() {
+            debug!(%conn_id, "connected, but the pool is full");
+            let cause = e!(PoolConnectError::TooManyConnections);
+            self.fail_attempt(conn_id.peer, attempt, cause);
+            close_connection(&connection, CloseReason::TooManyConnections);
+            return;
+        }
+        let PendingConnection {
+            counter,
+            mut callers,
+            requests,
+            ..
+        } = attempt;
+        callers.extend(requests);
+        let conn = PooledConnection::new(connection, counter);
+        self.insert_connection(conn, callers);
+    }
+
+    /// Retires a failed attempt and fails its callers with `cause`.
+    ///
+    /// Requests want any connection, so they are handled again, unless the
+    /// attempt was a dial and nothing else to the peer is left.
+    fn fail_attempt(
+        &mut self,
+        id: EndpointId,
+        attempt: PendingConnection,
+        cause: PoolConnectError,
+    ) {
+        let PendingConnection {
+            counter,
+            origin,
+            callers,
+            requests,
+            ..
+        } = attempt;
+        drop(counter);
+        fail_waiters(callers, &cause);
+        let others = self
+            .peers
+            .get(&id)
+            .is_some_and(|peer| peer.current.is_some() || !peer.attempts.is_empty());
+        if matches!(origin, Origin::Dial) && !others {
+            fail_waiters(requests, &cause);
+        } else {
+            for tx in requests.into_iter().filter(|tx| !tx.is_closed()) {
+                self.handle_request(RequestRef { id, tx });
+            }
+        }
+        self.drop_peer_if_empty(id);
+    }
+
+    /// Adds `conn` to the pool and hands it to `waiters`.
+    ///
+    /// It becomes current, unless it is an adoption and a newer connection is
+    /// current already. A connection we dialed always becomes current.
+    fn insert_connection(&mut self, conn: PooledConnection, mut waiters: Vec<RefSender>) {
+        let conn_id = conn.conn_id();
+        let peer = self.peers.entry(conn_id.peer).or_default();
+        // Adoptions finish out of order, and the one the peer opened last wins.
+        let newer_is_current = conn.connection.side() == Side::Server
+            && peer
+                .current
+                .as_ref()
+                .is_some_and(|current| current.conn_id().generation > conn_id.generation);
+        if newer_is_current {
+            debug!(%conn_id, "a newer connection is current, adding this one as superseded");
+            conn.counter.mark_superseded();
+        } else {
+            if let Some(previous) = peer.current.take() {
+                // The peer may still use it, so it stays until unused.
+                debug!(%conn_id, "the new connection supersedes the current one");
+                previous.counter.mark_superseded();
+                peer.superseded.push(previous);
+            }
+            for attempt in &mut peer.attempts {
+                waiters.append(&mut attempt.requests);
+            }
+        }
+        for tx in waiters {
+            // A gone caller's reference would only send a spurious unused event.
+            if tx.is_closed() {
+                continue;
+            }
+            let _ = tx.send(Ok(conn.conn_ref()));
+        }
+        debug!(%conn_id, refs = conn.counter.current(), "connected");
+        let connection = conn.connection.clone();
+        let unused = conn.is_unused();
+        if newer_is_current {
+            // Keep the list oldest first, which is the order the cap closes in.
+            let index = peer
+                .superseded
+                .partition_point(|superseded| superseded.conn_id().generation < conn_id.generation);
+            peer.superseded.insert(index, conn);
+        } else {
+            peer.current = Some(conn);
+        }
+
+        // Create a future that waits for the connection to close.
+        self.conn_close.push(Box::pin(async move {
+            connection.closed().await;
+            conn_id
+        }));
+        if unused {
+            self.unused.insert(conn_id, Instant::now());
+        }
+        self.close_oldest_superseded(conn_id.peer);
+    }
+
+    /// Closes the peer's oldest superseded connections beyond the cap.
+    fn close_oldest_superseded(&mut self, id: EndpointId) {
+        loop {
+            let Some(peer) = self.peers.get_mut(&id) else {
+                return;
+            };
+            if peer.superseded.len() <= self.options.max_superseded_per_peer {
+                return;
+            }
+            let conn = peer.superseded.remove(0);
+            debug!(conn_id = %conn.conn_id(), "too many superseded connections, closing the oldest");
+            self.unused.remove(conn.conn_id());
+            conn.close_as(CloseReason::Superseded);
         }
     }
 
     /// Handles a connection closing, by us or by the peer.
-    ///
-    /// Only acts if the connection is still the peer's current one. One the
-    /// pool replaced has closed already, and must not take down its successor.
     fn handle_conn_closed(&mut self, conn_id: ConnId) {
-        let current = matches!(
-            self.peers.get(&conn_id.peer),
-            Some(PeerState::Ready { generation, .. }) if *generation == conn_id.generation
-        );
-        if current {
+        if self.remove_connection(conn_id).is_some() {
             trace!(%conn_id, "connection closed");
-            self.remove_peer(conn_id.peer);
         }
     }
 
     /// Handles a connection going unused.
     ///
-    /// Only acts if the connection is still the peer's current one. References
-    /// to a connection the pool replaced can outlive it, and their last drop
-    /// must not restart its successor's idle timeout.
+    /// Only acts if the pool still holds the connection. References to a
+    /// connection the pool replaced can outlive it, and their last drop must
+    /// not restart its successor's idle timeout.
     fn handle_unused_event(&mut self, conn_id: ConnId) {
-        let Some(PeerState::Ready {
-            generation,
-            counter,
-            ..
-        }) = self.peers.get(&conn_id.peer)
-        else {
+        let Some(conn) = self.connection(conn_id) else {
             return;
         };
-        if *generation != conn_id.generation {
-            return;
-        }
         // Connection was handed out in the meantime.
-        if !counter.is_unused() {
+        if !conn.is_unused() {
             return;
         }
         self.unused.insert(conn_id, Instant::now());
-        trace!(%conn_id, "peer unused");
+        trace!(%conn_id, "connection unused");
     }
 
     /// Closes the connections that have been unused for the idle timeout.
     fn close_unused(&mut self) {
         let now = Instant::now();
-        while let Some(conn_id) = self.unused.pop_expired(now, self.options.idle_timeout) {
-            trace!(%conn_id, "unused timeout, removing");
-            self.remove_peer(conn_id.peer);
+        let timeout = self.options.idle_timeout;
+        while let Some(conn_id) = self.unused.pop_expired(now, timeout) {
+            let Some(conn) = self.take_unused(conn_id) else {
+                continue;
+            };
+            trace!(%conn_id, "unused timeout, closing");
+            conn.close_as(CloseReason::Unused);
         }
     }
 
-    fn remove_peer(&mut self, id: EndpointId) {
-        if let Some(state) = self.peers.remove(&id) {
-            match state {
-                PeerState::Connecting { waiters, .. } => {
-                    for tx in waiters {
-                        let _ = tx.send(Err(e!(PoolConnectError::Closed)));
-                    }
-                }
-                PeerState::Ready {
-                    generation,
-                    connection,
-                    counter,
-                } => {
-                    let reason: &[u8] = if counter.is_unused() {
-                        b"unused"
-                    } else {
-                        b"drop"
-                    };
-                    connection.close(0u32.into(), reason);
-                    self.unused.remove(ConnId {
-                        peer: id,
-                        generation,
-                    });
-                }
-            }
+    /// Closes every connection to `id`, and fails the attempts with `cause`.
+    fn close_peer(&mut self, id: EndpointId, cause: PoolConnectError) {
+        let Some(peer) = self.peers.remove(&id) else {
+            return;
+        };
+        let Peer {
+            current,
+            attempts,
+            superseded,
+        } = peer;
+        for conn in current.into_iter().chain(superseded) {
+            self.release(conn);
+        }
+        for attempt in attempts {
+            fail_waiters(attempt.close_as(CloseReason::Closed), &cause);
+        }
+    }
+
+    /// Stops holding the connection, and closes it.
+    fn release(&mut self, conn: PooledConnection) {
+        self.unused.remove(conn.conn_id());
+        conn.close();
+    }
+
+    /// Stops holding the connection, and returns it.
+    ///
+    /// The caller closes it if it is still open: a connection the pool evicts
+    /// is closed differently from one the peer closed.
+    fn remove_connection(&mut self, conn_id: ConnId) -> Option<PooledConnection> {
+        let peer = self.peers.get_mut(&conn_id.peer)?;
+        let conn = peer.remove_connection(conn_id)?;
+        self.unused.remove(conn_id);
+        self.drop_peer_if_empty(conn_id.peer);
+        Some(conn)
+    }
+
+    /// Forgets the peer if the pool holds nothing for it.
+    fn drop_peer_if_empty(&mut self, id: EndpointId) {
+        if self.peers.get(&id).is_some_and(Peer::is_empty) {
+            self.peers.remove(&id);
         }
     }
 }
-
-/// A connection pool
+/// A pool of connections to endpoints, for one ALPN.
+///
+/// Clones share the pool. Once the last clone is dropped, the pool closes
+/// every connection it holds.
 #[derive(Debug, Clone)]
 pub struct ConnectionPool {
     tx: mpsc::Sender<ActorMessage>,
 }
 
 impl ConnectionPool {
+    /// Creates a pool that dials with `endpoint`, for `alpn`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a Tokio runtime, since the pool spawns a task.
     pub fn new(endpoint: Endpoint, alpn: &[u8], options: Options) -> Self {
         let (actor, tx) = Actor::new(endpoint, alpn, options);
         n0_future::task::spawn(actor.run());
@@ -683,8 +1127,8 @@ impl ConnectionPool {
 
     /// Returns either a fresh connection or a reference to an existing one.
     ///
-    /// This is guaranteed to return after approximately [Options::connect_timeout]
-    /// with either an error or a connection.
+    /// If a dial or an adoption to the endpoint is running, this waits for the
+    /// first one to finish. If it fails, the request is handled again.
     pub async fn get_or_connect(
         &self,
         id: EndpointId,
@@ -697,10 +1141,52 @@ impl ConnectionPool {
         rx.await.map_err(|_| e!(PoolConnectError::Shutdown))?
     }
 
-    /// Close an existing connection, if it exists
+    /// Adopts an incoming connection and returns a reference to it.
     ///
-    /// This will finish pending tasks and close the connection. New tasks will
-    /// get a new connection if they are submitted after this call
+    /// [`Options::on_connected`] runs for the connection as it would for a
+    /// dialed one. Then the connection becomes the current one for its
+    /// endpoint:
+    ///
+    /// - Later [`Self::get_or_connect`] calls return it.
+    /// - Requests waiting for a dial to the endpoint get it. The dial runs on,
+    ///   and once it connects, it becomes current in turn.
+    /// - [`ConnectionRef::is_superseded`] tells holders of the previous
+    ///   connection to move on.
+    ///
+    /// If a connection the endpoint opened later is current already, this one is
+    /// returned as superseded.
+    ///
+    /// The previous connection stays open until it is unused, since the remote
+    /// may still be using it.
+    ///
+    /// The pool does not check the connection's ALPN.
+    ///
+    /// # Errors
+    ///
+    /// - [`PoolConnectError::OnConnectError`] if `on_connected` fails.
+    /// - [`PoolConnectError::TooManyConnections`] if the pool is full.
+    /// - [`PoolConnectError::Closed`] if the connection closes before it is
+    ///   adopted, or [`Self::close`] closes its endpoint meanwhile.
+    /// - [`PoolConnectError::Shutdown`] if the pool is shut down.
+    pub async fn handle_connection(
+        &self,
+        conn: Connection,
+    ) -> std::result::Result<ConnectionRef, PoolConnectError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(ActorMessage::HandleConnection { conn, tx })
+            .await
+            .map_err(|_| e!(PoolConnectError::Shutdown))?;
+        rx.await.map_err(|_| e!(PoolConnectError::Shutdown))?
+    }
+
+    /// Closes every connection to `id`.
+    ///
+    /// That includes superseded connections, even in use. Requests waiting for
+    /// a connection to `id` fail with [`PoolConnectError::Closed`].
+    ///
+    /// A running dial's connection is closed once the dial ends, after
+    /// [`Options::on_connected`] if that is already running.
     pub async fn close(&self, id: EndpointId) -> std::result::Result<(), ConnectionPoolError> {
         self.tx
             .send(ActorMessage::ConnectionShutdown { id })
@@ -712,13 +1198,59 @@ impl ConnectionPool {
 
 #[derive(Debug)]
 struct ConnectionCounterInner {
-    count: AtomicUsize,
+    /// The reference count, with the [`RETIRED`] bit.
+    ///
+    /// One atomic, so retiring an unused connection and upgrading it exclude
+    /// each other.
+    state: AtomicU64,
     /// Which connection this counts, which its unused events name.
     conn_id: ConnId,
     unused_tx: mpsc::UnboundedSender<ConnId>,
+    /// Set once a newer connection to the same endpoint took this one's place.
+    superseded: AtomicBool,
 }
 
-#[derive(Debug, Clone)]
+impl ConnectionCounterInner {
+    /// Takes a reference, for a connection the pool holds as open.
+    fn get_one(self: &Arc<Self>) -> OneConnection {
+        self.state.fetch_add(1, Ordering::AcqRel);
+        OneConnection {
+            inner: self.clone(),
+        }
+    }
+
+    /// Takes a reference, unless the pool no longer holds the connection.
+    fn try_get_one(self: &Arc<Self>) -> Option<OneConnection> {
+        self.state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state & RETIRED == 0).then_some(state + 1)
+            })
+            .ok()?;
+        Some(OneConnection {
+            inner: self.clone(),
+        })
+    }
+
+    /// Retires the connection, so that upgrades fail from now on.
+    fn retire(&self) {
+        self.state.fetch_or(RETIRED, Ordering::AcqRel);
+    }
+
+    /// Returns whether a newer connection to the peer took this one's place.
+    fn is_superseded(&self) -> bool {
+        self.superseded.load(Ordering::SeqCst)
+    }
+}
+
+/// The bit of [`ConnectionCounterInner::state`] that marks a connection the pool no longer holds.
+const RETIRED: u64 = 1 << 63;
+
+/// The pool's hold on a connection's reference count, which retires it on drop.
+///
+/// It is not `Clone`: the pool keeps one per connection it holds or is making,
+/// so the counter retires exactly when the pool lets go. Weak references and
+/// the connect future share the [`ConnectionCounterInner`].
+#[derive(Debug)]
 struct ConnectionCounter {
     inner: Arc<ConnectionCounterInner>,
 }
@@ -727,26 +1259,54 @@ impl ConnectionCounter {
     fn new(conn_id: ConnId, unused_tx: mpsc::UnboundedSender<ConnId>) -> Self {
         Self {
             inner: Arc::new(ConnectionCounterInner {
-                count: AtomicUsize::new(0),
+                state: AtomicU64::new(0),
                 conn_id,
                 unused_tx,
+                superseded: AtomicBool::new(false),
             }),
         }
     }
 
-    fn current(&self) -> usize {
-        self.inner.count.load(Ordering::SeqCst)
+    /// Returns the state that references to the connection share.
+    fn shared(&self) -> Arc<ConnectionCounterInner> {
+        self.inner.clone()
+    }
+
+    /// Returns which connection this counts.
+    fn conn_id(&self) -> ConnId {
+        self.inner.conn_id
+    }
+
+    fn current(&self) -> u64 {
+        self.inner.state.load(Ordering::Acquire) & !RETIRED
     }
 
     fn is_unused(&self) -> bool {
         self.current() == 0
     }
 
+    /// Takes a reference, for a connection the pool holds as open.
     fn get_one(&self) -> OneConnection {
-        self.inner.count.fetch_add(1, Ordering::SeqCst);
-        OneConnection {
-            inner: self.inner.clone(),
-        }
+        self.inner.get_one()
+    }
+
+    /// Retires an unused connection, and returns whether it was unused.
+    fn try_retire_unused(&self) -> bool {
+        self.inner
+            .state
+            .compare_exchange(0, RETIRED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Marks that a newer connection to the peer took this one's place.
+    fn mark_superseded(&self) {
+        self.inner.superseded.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for ConnectionCounter {
+    fn drop(&mut self) {
+        self.inner.retire();
     }
 }
 
@@ -756,148 +1316,93 @@ struct OneConnection {
     inner: Arc<ConnectionCounterInner>,
 }
 
+impl OneConnection {
+    /// Returns whether a newer connection to the peer took this one's place.
+    fn is_superseded(&self) -> bool {
+        self.inner.is_superseded()
+    }
+}
+
+impl Clone for OneConnection {
+    fn clone(&self) -> Self {
+        // No retirement check: the count is at least one while `self` lives.
+        self.inner.state.fetch_add(1, Ordering::AcqRel);
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 impl Drop for OneConnection {
     fn drop(&mut self) {
-        if self.inner.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+        let previous = self.inner.state.fetch_sub(1, Ordering::AcqRel);
+        if previous & !RETIRED == 1 {
             // Send an unused event to the actor.
             let _ = self.inner.unused_tx.send(self.inner.conn_id);
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::{
         collections::BTreeMap,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
     };
 
     use iroh::{
-        EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr,
+        Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr,
         address_lookup::MemoryLookup,
-        endpoint::{Connection, presets},
+        endpoint::{Connection, ConnectionError, presets},
         protocol::{AcceptError, ProtocolHandler, Router},
     };
-    use n0_error::{AnyError, Result, StdResultExt};
+    use n0_error::{Result, StdResultExt};
     use n0_future::{BufferedStreamExt, StreamExt, io, stream};
     use testresult::TestResult;
-    use tokio::sync::oneshot;
-    use tracing::trace;
+    use tokio::{sync::oneshot, task::JoinHandle};
 
     use super::{
-        Actor, ConnId, ConnectionCounter, ConnectionPool, Generation, OnConnected, Options,
-        PeerState, PoolConnectError, RequestRef,
+        Actor, CloseReason, ConnId, ConnectionCounter, ConnectionPool, ConnectionRef, Generation,
+        Options, PoolConnectError, PooledConnection, RequestRef, WeakConnectionRef,
     };
 
-    /// Puts `conn` into `actor` as its peer's current connection.
-    ///
-    /// Returns which connection it is, for the events a test hands the actor.
-    fn insert_ready(actor: &mut Actor, conn: &Connection) -> ConnId {
-        let conn_id = ConnId {
-            peer: conn.remote_id(),
-            generation: Generation(1),
-        };
-        let counter = ConnectionCounter::new(conn_id, actor.unused_tx.clone());
-        if counter.is_unused() {
-            actor
-                .unused
-                .insert(conn_id, n0_future::time::Instant::now());
-        }
-        actor.peers.insert(
-            conn_id.peer,
-            PeerState::Ready {
-                generation: conn_id.generation,
-                connection: conn.clone(),
-                counter,
-            },
-        );
-        conn_id
-    }
-
-    /// Returns the id of a connection to `peer` that the pool never made.
-    fn stale_conn_id(peer: EndpointId) -> ConnId {
-        ConnId {
-            peer,
-            generation: Generation(0),
-        }
-    }
-
     const ECHO_ALPN: &[u8] = b"echo";
+    const INCOMING_ALPN: &[u8] = b"iroh-util/pool-incoming-test/0";
+    const SHORT_IDLE: Duration = Duration::from_millis(200);
+
+    /// Asserts that `$res` is the `PoolConnectError` variant `$variant`.
+    macro_rules! assert_err {
+        ($res:expr, $variant:ident) => {{
+            let res = $res;
+            assert!(
+                matches!(res, Err(PoolConnectError::$variant { .. })),
+                "expected {}: {res:?}",
+                stringify!($variant)
+            );
+        }};
+    }
 
     #[derive(Debug, Clone)]
     struct Echo;
 
     impl ProtocolHandler for Echo {
         async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-            let conn_id = connection.stable_id();
-            let id = connection.remote_id();
-            trace!(%id, %conn_id, "Accepting echo connection");
-            loop {
-                match connection.accept_bi().await {
-                    Ok((mut send, mut recv)) => {
-                        trace!(%id, %conn_id, "Accepted echo request");
-                        tokio::io::copy(&mut recv, &mut send).await?;
-                        send.finish().map_err(AcceptError::from_err)?;
-                    }
-                    Err(e) => {
-                        trace!(%id, %conn_id, "Failed to accept echo request {e}");
-                        break;
-                    }
-                }
+            while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                tokio::io::copy(&mut recv, &mut send).await?;
+                send.finish().map_err(AcceptError::from_err)?;
             }
             Ok(())
         }
     }
 
-    async fn echo_client(conn: &Connection, text: &[u8]) -> Result<Vec<u8>> {
-        let conn_id = conn.stable_id();
-        let id = conn.remote_id();
-        trace!(%id, %conn_id, "Sending echo request");
+    async fn echo(conn: &Connection, text: &[u8]) -> Result<Vec<u8>> {
         let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
         send.write_all(text).await.anyerr()?;
         send.finish().anyerr()?;
-        let response = recv.read_to_end(1000).await.anyerr()?;
-        trace!(%id, %conn_id, "Received echo response");
-        Ok(response)
-    }
-
-    async fn echo_server() -> TestResult<(EndpointAddr, Router)> {
-        let endpoint = iroh::Endpoint::builder(presets::N0)
-            .alpns(vec![ECHO_ALPN.to_vec()])
-            .bind()
-            .await?;
-        endpoint.online().await;
-        let addr = endpoint.addr();
-        let router = iroh::protocol::Router::builder(endpoint)
-            .accept(ECHO_ALPN, Echo)
-            .spawn();
-
-        Ok((addr, router))
-    }
-
-    async fn echo_servers(n: usize) -> TestResult<(Vec<EndpointId>, Vec<Router>, MemoryLookup)> {
-        let res = stream::iter(0..n)
-            .map(|_| echo_server())
-            .buffered_unordered(16)
-            .collect::<Vec<_>>()
-            .await;
-        let res: Vec<(EndpointAddr, Router)> = res.into_iter().collect::<TestResult<Vec<_>>>()?;
-        let (addrs, routers): (Vec<_>, Vec<_>) = res.into_iter().unzip();
-        let ids = addrs.iter().map(|a| a.id).collect::<Vec<_>>();
-        let address_lookup = MemoryLookup::from_endpoint_info(addrs);
-        Ok((ids, routers, address_lookup))
-    }
-
-    async fn shutdown_routers(routers: Vec<Router>) {
-        stream::iter(routers)
-            .for_each_concurrent(16, |router| async move {
-                let _ = router.shutdown().await;
-            })
-            .await;
+        recv.read_to_end(1000).await.anyerr()
     }
 
     fn test_options() -> Options {
@@ -905,208 +1410,395 @@ mod tests {
             idle_timeout: Duration::from_millis(100),
             connect_timeout: Duration::from_secs(5),
             max_connections: 32,
-            on_connected: None,
+            ..Default::default()
         }
     }
 
-    struct EchoClient {
-        pool: ConnectionPool,
-    }
-
-    impl EchoClient {
-        async fn echo(
-            &self,
-            id: EndpointId,
-            text: Vec<u8>,
-        ) -> Result<Result<(usize, Vec<u8>), AnyError>, PoolConnectError> {
-            let conn = self.pool.get_or_connect(id).await?;
-            let id = conn.stable_id();
-            match echo_client(&conn, &text).await {
-                Ok(res) => Ok(Ok((id, res))),
-                Err(e) => Ok(Err(e)),
-            }
+    fn short_idle_options() -> Options {
+        Options {
+            idle_timeout: SHORT_IDLE,
+            ..Default::default()
         }
     }
 
-    #[tokio::test]
-    async fn connection_pool_errors() -> TestResult<()> {
-        let address_lookup = MemoryLookup::new();
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup.clone())
-            .bind()
-            .await?;
-        let pool = ConnectionPool::new(endpoint.clone(), ECHO_ALPN, test_options());
-        let client = EchoClient { pool };
-        {
-            let non_existing = SecretKey::from_bytes(&[0; 32]).public();
-            let res = client.echo(non_existing, b"Hello, world!".to_vec()).await;
-            assert!(matches!(res, Err(PoolConnectError::ConnectError { .. })));
-        }
-        {
-            let non_listening = SecretKey::from_bytes(&[0; 32]).public();
-            address_lookup.add_endpoint_info(EndpointAddr {
-                id: non_listening,
-                addrs: vec![TransportAddr::Ip("127.0.0.1:12121".parse().unwrap())]
-                    .into_iter()
-                    .collect(),
-            });
-            let res = client.echo(non_listening, b"Hello, world!".to_vec()).await;
-            assert!(matches!(res, Err(PoolConnectError::Timeout { .. })));
-        }
-        endpoint.close().await;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn connection_pool_smoke() -> TestResult<()> {
-        let n = 32;
-        let (ids, routers, address_lookup) = echo_servers(n).await?;
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup.clone())
-            .bind()
-            .await?;
-        let pool = ConnectionPool::new(endpoint.clone(), ECHO_ALPN, test_options());
-        let client = EchoClient { pool };
-        let mut connection_ids = BTreeMap::new();
-        let msg = b"Hello, pool!".to_vec();
-        for id in &ids {
-            let (cid1, res) = client.echo(*id, msg.clone()).await??;
-            assert_eq!(res, msg);
-            let (cid2, res) = client.echo(*id, msg.clone()).await??;
-            assert_eq!(res, msg);
-            assert_eq!(cid1, cid2);
-            connection_ids.insert(id, cid1);
-        }
-        n0_future::time::sleep(Duration::from_millis(1000)).await;
-        for id in &ids {
-            let cid1 = *connection_ids.get(id).expect("Connection ID not found");
-            let (cid2, res) = client.echo(*id, msg.clone()).await??;
-            assert_eq!(res, msg);
-            assert_ne!(cid1, cid2);
-        }
-        shutdown_routers(routers).await;
-        endpoint.close().await;
-        Ok(())
-    }
-
-    /// Tests that unused connections are being reclaimed to make room if we hit the
-    /// maximum connection limit.
-    #[tokio::test]
-    async fn connection_pool_unused() -> TestResult<()> {
-        let n = 32;
-        let (ids, routers, address_lookup) = echo_servers(n).await?;
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup.clone())
-            .bind()
-            .await?;
-        let pool = ConnectionPool::new(
-            endpoint.clone(),
-            ECHO_ALPN,
-            Options {
-                idle_timeout: Duration::from_secs(100),
-                max_connections: 8,
-                ..test_options()
-            },
-        );
-        let client = EchoClient { pool };
-        let msg = b"Hello, pool!".to_vec();
-        for id in &ids {
-            let (_, res) = client.echo(*id, msg.clone()).await??;
-            assert_eq!(res, msg);
-        }
-        shutdown_routers(routers).await;
-        endpoint.close().await;
-        Ok(())
-    }
-
-    /// Uses an on_connected callback that just errors out every time.
-    #[tokio::test]
-    async fn on_connected_error() -> TestResult<()> {
-        let n = 1;
-        let (ids, routers, address_lookup) = echo_servers(n).await?;
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup)
-            .bind()
-            .await?;
-        let on_connected: OnConnected =
-            Arc::new(|_, _| Box::pin(async { Err(io::Error::other("on_connect failed")) }));
-        let pool = ConnectionPool::new(
-            endpoint.clone(),
-            ECHO_ALPN,
-            Options {
-                on_connected: Some(on_connected),
-                ..test_options()
-            },
-        );
-        let client = EchoClient { pool };
-        let msg = b"Hello, pool!".to_vec();
-        for id in &ids {
-            let res = client.echo(*id, msg.clone()).await;
-            assert!(matches!(res, Err(PoolConnectError::OnConnectError { .. })));
-        }
-        shutdown_routers(routers).await;
-        endpoint.close().await;
-        Ok(())
-    }
-
-    /// Uses an on_connected callback to ensure that the connection is direct.
-    #[tokio::test]
-    async fn on_connected_direct() -> TestResult<()> {
-        let n = 1;
-        let (ids, routers, address_lookup) = echo_servers(n).await?;
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup)
-            .bind()
-            .await?;
-        let on_connected = |_, conn: Connection| async move {
-            let mut stream = conn.paths_stream();
-            while let Some(paths) = stream.next().await {
-                if paths.iter().any(|path| path.is_ip()) {
-                    return Ok(());
-                }
-            }
-            Err(io::Error::other("connection closed before becoming direct"))
-        };
-        let pool = ConnectionPool::new(
-            endpoint.clone(),
-            ECHO_ALPN,
-            test_options().with_on_connected(on_connected),
-        );
-        let client = EchoClient { pool };
-        let msg = b"Hello, pool!".to_vec();
-        for id in &ids {
-            let res = client.echo(*id, msg.clone()).await;
-            assert!(res.is_ok());
-        }
-        shutdown_routers(routers).await;
-        endpoint.close().await;
-        Ok(())
-    }
-
-    /// Bind a UDP socket to a free loopback port and keep it alive for the
-    /// caller's lifetime. iroh `connect()` against this address will time
-    /// out (no QUIC handshake response), avoiding both hardcoded ports
-    /// (which can clash) and unbound ones (which OSes may rebind).
+    /// Binds a UDP socket on loopback that never answers, so dials to it time out.
+    ///
+    /// The caller keeps the socket, so the OS cannot give the port to another.
     fn dead_addr() -> TestResult<(std::net::UdpSocket, TransportAddr)> {
         let sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
         let addr = TransportAddr::Ip(sock.local_addr()?);
         Ok((sock, addr))
     }
 
-    /// Spawn `n` concurrent `get_or_connect(id)` calls and yield until each
-    /// task has at least entered its body.
-    async fn enter_get_or_connect(
+    /// Requests a connection to `id` on a task.
+    fn spawn_get(
+        pool: &ConnectionPool,
+        id: EndpointId,
+    ) -> JoinHandle<Result<ConnectionRef, PoolConnectError>> {
+        let pool = pool.clone();
+        tokio::spawn(async move { pool.get_or_connect(id).await })
+    }
+
+    /// Asserts that the pool closed a connection with `reason`.
+    fn assert_closed_as(err: &ConnectionError, reason: CloseReason) {
+        assert!(
+            matches!(
+                err,
+                ConnectionError::ApplicationClosed(frame)
+                    if frame.error_code == reason.code() && frame.reason[..] == *reason.reason()
+            ),
+            "closed for the wrong reason: {err:?}"
+        );
+    }
+
+    /// Waits until the pool no longer holds the connection behind `weak`.
+    async fn until_retired(weak: &WeakConnectionRef) -> TestResult<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while weak.upgrade().is_some() {
+                n0_future::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "the pool kept the connection")?;
+        Ok(())
+    }
+
+    /// Returns options whose `on_connected` handles its `n`th call per `script(n)`.
+    ///
+    /// The script gives a delay, and whether to accept the connection after it.
+    /// Also returns a weak reference to each connection the callback ran for.
+    fn scripted(
+        options: Options,
+        script: impl Fn(usize) -> (Duration, bool) + Send + Sync + 'static,
+    ) -> (Options, Arc<Mutex<Vec<WeakConnectionRef>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let options = options.with_on_connected({
+            let seen = seen.clone();
+            move |_, conn: ConnectionRef| {
+                let (delay, accept) = {
+                    let mut seen = seen.lock().expect("poisoned");
+                    seen.push(conn.downgrade());
+                    script(seen.len() - 1)
+                };
+                async move {
+                    n0_future::time::sleep(delay).await;
+                    accept
+                        .then_some(())
+                        .ok_or_else(|| io::Error::other("rejected"))
+                }
+            }
+        });
+        (options, seen)
+    }
+
+    /// Returns options whose `on_connected` takes `delay` and accepts.
+    fn slow(delay: Duration) -> (Options, Arc<Mutex<Vec<WeakConnectionRef>>>) {
+        scripted(short_idle_options(), move |_| (delay, true))
+    }
+
+    /// Echo servers, and a client endpoint that reaches them by direct address.
+    ///
+    /// Everything stays on loopback, so the tests need no network.
+    struct EchoNet {
+        ids: Vec<EndpointId>,
+        routers: Vec<Router>,
+        lookup: MemoryLookup,
+        client: Endpoint,
+    }
+
+    impl EchoNet {
+        async fn new(n: usize) -> TestResult<Self> {
+            let lookup = MemoryLookup::new();
+            let mut ids = Vec::new();
+            let mut routers = Vec::new();
+            for _ in 0..n {
+                let endpoint = Endpoint::builder(presets::Minimal)
+                    .alpns(vec![ECHO_ALPN.to_vec()])
+                    .bind()
+                    .await?;
+                lookup.add_endpoint_info(endpoint.addr());
+                ids.push(endpoint.id());
+                routers.push(Router::builder(endpoint).accept(ECHO_ALPN, Echo).spawn());
+            }
+            let client = Endpoint::builder(presets::Minimal)
+                .address_lookup(lookup.clone())
+                .bind()
+                .await?;
+            Ok(Self {
+                ids,
+                routers,
+                lookup,
+                client,
+            })
+        }
+
+        fn pool(&self, options: Options) -> ConnectionPool {
+            ConnectionPool::new(self.client.clone(), ECHO_ALPN, options)
+        }
+
+        /// Adds a peer whose address never answers.
+        fn dead_peer(&self, seed: u8) -> TestResult<(std::net::UdpSocket, EndpointId)> {
+            let (sock, addr) = dead_addr()?;
+            let id = SecretKey::from_bytes(&[seed; 32]).public();
+            self.lookup
+                .add_endpoint_info(EndpointAddr::from_parts(id, [addr]));
+            Ok((sock, id))
+        }
+
+        async fn shutdown(self) {
+            stream::iter(self.routers)
+                .for_each_concurrent(16, |router| async move {
+                    let _ = router.shutdown().await;
+                })
+                .await;
+            self.client.close().await;
+        }
+    }
+
+    /// A pool on a server endpoint, and a client that opens connections to it.
+    struct Incoming {
         pool: ConnectionPool,
+        server: Endpoint,
+        client: Endpoint,
+    }
+
+    impl Incoming {
+        async fn new(options: Options) -> TestResult<Self> {
+            let server = Endpoint::builder(presets::Minimal)
+                .alpns(vec![INCOMING_ALPN.to_vec()])
+                .bind()
+                .await?;
+            let client = Endpoint::bind(presets::Minimal).await?;
+            let pool = ConnectionPool::new(server.clone(), INCOMING_ALPN, options);
+            Ok(Self {
+                pool,
+                server,
+                client,
+            })
+        }
+
+        /// Opens a connection from the client, and returns both ends.
+        async fn pair(&self) -> TestResult<(Connection, Connection)> {
+            self.pair_from(&self.client).await
+        }
+
+        /// Opens a connection from `client`, and returns both ends.
+        async fn pair_from(&self, client: &Endpoint) -> TestResult<(Connection, Connection)> {
+            let (outgoing, incoming) =
+                tokio::join!(client.connect(self.server.addr(), INCOMING_ALPN), async {
+                    self.server.accept().await.expect("endpoint closed").await
+                });
+            Ok((outgoing?, incoming?))
+        }
+
+        /// Opens a connection, and hands the server end to the pool.
+        async fn adopt(&self) -> TestResult<(Connection, ConnectionRef)> {
+            let (outgoing, incoming) = self.pair().await?;
+            Ok((outgoing, self.pool.handle_connection(incoming).await?))
+        }
+
+        /// Hands `incoming` to the pool on a task.
+        fn spawn_adopt(
+            &self,
+            incoming: Connection,
+        ) -> JoinHandle<Result<ConnectionRef, PoolConnectError>> {
+            let pool = self.pool.clone();
+            tokio::spawn(async move { pool.handle_connection(incoming).await })
+        }
+
+        /// Returns the pool's connection to the client.
+        async fn current(&self) -> Result<ConnectionRef, PoolConnectError> {
+            self.pool.get_or_connect(self.client.id()).await
+        }
+    }
+
+    /// Two connections from the client, both adopted: the second supersedes the first.
+    struct Superseded {
+        net: Incoming,
+        /// Client ends of the two connections.
+        first: Connection,
+        second: Connection,
+        first_ref: ConnectionRef,
+        second_ref: ConnectionRef,
+    }
+
+    impl Superseded {
+        async fn new(options: Options) -> TestResult<Self> {
+            let net = Incoming::new(options).await?;
+            let (first, first_ref) = net.adopt().await?;
+            let (second, second_ref) = net.adopt().await?;
+            Ok(Self {
+                net,
+                first,
+                second,
+                first_ref,
+                second_ref,
+            })
+        }
+    }
+
+    /// An actor that is not running, and holds one unused connection as current.
+    ///
+    /// Tests call its handlers directly, so the order of events is certain.
+    struct Held {
+        actor: Actor,
+        conn_id: ConnId,
+        /// The server end, which the actor holds.
+        conn: Connection,
+        _outgoing: Connection,
+        net: Incoming,
+    }
+
+    impl Held {
+        async fn new(options: Options) -> TestResult<Self> {
+            let net = Incoming::new(Options::default()).await?;
+            let (outgoing, conn) = net.pair().await?;
+            let (mut actor, _tx) = Actor::new(net.server.clone(), INCOMING_ALPN, options);
+            let conn_id = ConnId {
+                peer: conn.remote_id(),
+                generation: Generation(1),
+            };
+            let counter = ConnectionCounter::new(conn_id, actor.unused_tx.clone());
+            actor.insert_connection(PooledConnection::new(conn.clone(), counter), Vec::new());
+            Ok(Self {
+                actor,
+                conn_id,
+                conn,
+                _outgoing: outgoing,
+                net,
+            })
+        }
+
+        /// Returns the id of a connection to the same peer that the pool never made.
+        fn stale_id(&self) -> ConnId {
+            ConnId {
+                peer: self.conn_id.peer,
+                generation: Generation(0),
+            }
+        }
+
+        /// Takes a reference the way an upgrade does, without the actor.
+        fn upgrade(&self) -> ConnectionRef {
+            let weak = self
+                .actor
+                .connection(self.conn_id)
+                .expect("not held")
+                .conn_ref()
+                .downgrade();
+            weak.upgrade().expect("not held")
+        }
+
+        /// Asserts that the actor still holds the connection, and it is open.
+        fn assert_kept(&self) {
+            assert!(
+                self.actor.connection(self.conn_id).is_some(),
+                "dropped a connection in use"
+            );
+            assert!(
+                self.conn.close_reason().is_none(),
+                "closed a connection in use"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_pool_errors() -> TestResult<()> {
+        let net = EchoNet::new(0).await?;
+        let pool = net.pool(Options {
+            connect_timeout: Duration::from_secs(1),
+            ..test_options()
+        });
+        let unknown = SecretKey::from_bytes(&[0; 32]).public();
+        assert_err!(pool.get_or_connect(unknown).await, ConnectError);
+        let (_sock, dead) = net.dead_peer(1)?;
+        assert_err!(pool.get_or_connect(dead).await, Timeout);
+        net.shutdown().await;
+        Ok(())
+    }
+
+    /// A connection is reused while in use or recently used, and replaced once idle.
+    #[tokio::test]
+    async fn connection_pool_smoke() -> TestResult<()> {
+        let net = EchoNet::new(32).await?;
+        let pool = net.pool(test_options());
+        let msg = b"Hello, pool!";
+        let mut first_ids = BTreeMap::new();
+        for id in &net.ids {
+            let conn = pool.get_or_connect(*id).await?;
+            assert_eq!(echo(&conn, msg).await?, msg);
+            let again = pool.get_or_connect(*id).await?;
+            assert_eq!(again.stable_id(), conn.stable_id());
+            first_ids.insert(*id, conn.stable_id());
+        }
+        n0_future::time::sleep(Duration::from_millis(1000)).await;
+        for id in &net.ids {
+            let conn = pool.get_or_connect(*id).await?;
+            assert_eq!(echo(&conn, msg).await?, msg);
+            assert_ne!(conn.stable_id(), first_ids[id]);
+        }
+        net.shutdown().await;
+        Ok(())
+    }
+
+    /// Unused connections are evicted to make room at the connection limit.
+    #[tokio::test]
+    async fn connection_pool_unused() -> TestResult<()> {
+        let net = EchoNet::new(32).await?;
+        let pool = net.pool(Options {
+            idle_timeout: Duration::from_secs(100),
+            max_connections: 8,
+            ..test_options()
+        });
+        for id in &net.ids {
+            let conn = pool.get_or_connect(*id).await?;
+            assert_eq!(echo(&conn, b"Hello, pool!").await?, b"Hello, pool!");
+        }
+        net.shutdown().await;
+        Ok(())
+    }
+
+    /// A connection whose `on_connected` failed is closed, and does not upgrade.
+    ///
+    /// Dropping it would not be enough: the callback may keep a handle to it.
+    #[tokio::test]
+    async fn on_connected_error_closes_the_connection() -> TestResult<()> {
+        let net = EchoNet::new(1).await?;
+        let (options, seen) = scripted(test_options(), |_| (Duration::ZERO, false));
+        let pool = net.pool(options);
+        assert_err!(pool.get_or_connect(net.ids[0]).await, OnConnectError);
+        let conn = seen.lock().expect("poisoned").pop().expect("not called");
+        assert!(conn.close_reason().is_some(), "the connection stayed open");
+        assert!(conn.upgrade().is_none(), "upgraded a rejected connection");
+        net.shutdown().await;
+        Ok(())
+    }
+
+    /// Uses an on_connected callback to ensure that the connection is direct.
+    #[tokio::test]
+    async fn on_connected_direct() -> TestResult<()> {
+        let net = EchoNet::new(1).await?;
+        let pool = net.pool(test_options().with_on_connected(
+            |_, conn: ConnectionRef| async move {
+                let mut stream = conn.paths_stream();
+                while let Some(paths) = stream.next().await {
+                    if paths.iter().any(|path| path.is_ip()) {
+                        return Ok(());
+                    }
+                }
+                Err(io::Error::other("connection closed before becoming direct"))
+            },
+        ));
+        pool.get_or_connect(net.ids[0]).await?;
+        net.shutdown().await;
+        Ok(())
+    }
+
+    /// Spawns `n` `get_or_connect(id)` calls and waits until each has started.
+    async fn enter_get_or_connect(
+        pool: &ConnectionPool,
         id: EndpointId,
         n: usize,
-    ) -> Vec<
-        tokio::task::JoinHandle<std::result::Result<super::ConnectionRef, super::PoolConnectError>>,
-    > {
+    ) -> Vec<JoinHandle<Result<ConnectionRef, PoolConnectError>>> {
         let started = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::with_capacity(n);
         for _ in 0..n {
@@ -1123,359 +1815,132 @@ mod tests {
         handles
     }
 
-    /// Concurrent get_or_connect calls for an unreachable peer must not
-    /// prevent a probe against an unrelated reachable peer from completing
-    /// in bounded time.
+    /// Many requests for an unreachable peer do not delay a request for another.
     #[tokio::test]
-    async fn connection_pool_dead_peer_backlog_does_not_wedge() -> TestResult<()> {
-        let (live_ids, routers, address_lookup) = echo_servers(1).await?;
-        let live_peer = live_ids[0];
-
-        let (_dead_sock, dead_transport_addr) = dead_addr()?;
-        let dead_peer = SecretKey::from_bytes(&[7; 32]).public();
-        address_lookup.add_endpoint_info(EndpointAddr {
-            id: dead_peer,
-            addrs: vec![dead_transport_addr].into_iter().collect(),
-        });
-
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup)
-            .bind()
-            .await?;
-
+    async fn connection_pool_dead_peer_does_not_delay_other_peers() -> TestResult<()> {
+        let net = EchoNet::new(1).await?;
+        let (_sock, dead) = net.dead_peer(7)?;
         let connect_timeout = Duration::from_secs(1);
-        let pool = ConnectionPool::new(
-            endpoint.clone(),
-            ECHO_ALPN,
-            Options {
-                connect_timeout,
-                ..test_options()
-            },
-        );
-
-        let backlog = enter_get_or_connect(pool.clone(), dead_peer, 150).await;
-
-        let probe_budget = connect_timeout * 5;
-        let probe = Instant::now();
-        let probe_result =
-            n0_future::time::timeout(probe_budget, pool.get_or_connect(live_peer)).await;
-        let elapsed = probe.elapsed();
-
-        for h in backlog {
-            h.abort();
-        }
-        shutdown_routers(routers).await;
-        endpoint.close().await;
-
-        match probe_result {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(e)) => panic!("live-peer probe errored after {elapsed:?}: {e:?}"),
-            Err(_) => {
-                panic!("live-peer probe did not complete within {probe_budget:?} — pool wedged")
-            }
-        }
-    }
-
-    /// Same setup as `connection_pool_dead_peer_backlog_does_not_wedge`,
-    /// with concurrency below the inbox capacity. The unrelated-peer probe
-    /// must complete within one `connect_timeout` window.
-    #[tokio::test]
-    async fn connection_pool_dead_peer_below_inbox_cap_is_unaffected() -> TestResult<()> {
-        let (live_ids, routers, address_lookup) = echo_servers(1).await?;
-        let live_peer = live_ids[0];
-
-        let (_dead_sock, dead_transport_addr) = dead_addr()?;
-        let dead_peer = SecretKey::from_bytes(&[8; 32]).public();
-        address_lookup.add_endpoint_info(EndpointAddr {
-            id: dead_peer,
-            addrs: vec![dead_transport_addr].into_iter().collect(),
+        let pool = net.pool(Options {
+            connect_timeout,
+            ..test_options()
         });
+        let backlog = enter_get_or_connect(&pool, dead, 150).await;
 
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup)
-            .bind()
-            .await?;
-        let connect_timeout = Duration::from_secs(1);
-        let pool = ConnectionPool::new(
-            endpoint.clone(),
-            ECHO_ALPN,
-            Options {
-                connect_timeout,
-                ..test_options()
-            },
-        );
-
-        let backlog = enter_get_or_connect(pool.clone(), dead_peer, 50).await;
-
-        let probe = Instant::now();
-        let res = pool.get_or_connect(live_peer).await;
-        let elapsed = probe.elapsed();
-        assert!(res.is_ok(), "live-peer connect failed: {res:?}");
-        assert!(
-            elapsed < connect_timeout,
-            "live-peer probe took {elapsed:?}"
-        );
-
-        for h in backlog {
-            h.abort();
+        let start = Instant::now();
+        pool.get_or_connect(net.ids[0]).await?;
+        let elapsed = start.elapsed();
+        assert!(elapsed < connect_timeout, "the live peer took {elapsed:?}");
+        for handle in backlog {
+            handle.abort();
         }
-        shutdown_routers(routers).await;
-        endpoint.close().await;
+        net.shutdown().await;
         Ok(())
     }
 
-    #[tokio::test]
-    async fn close_during_connect_returns_closed() -> TestResult<()> {
-        let (ids, routers, address_lookup) = echo_servers(1).await?;
-        let id = ids[0];
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup)
-            .bind()
-            .await?;
-        let handshake = Duration::from_millis(1000);
-        let pool = ConnectionPool::new(
-            endpoint.clone(),
-            ECHO_ALPN,
-            test_options().with_on_connected(move |_, _| async move {
-                n0_future::time::sleep(handshake).await;
-                Ok(())
-            }),
-        );
-        let first = {
-            let pool = pool.clone();
-            n0_future::task::spawn(async move { pool.get_or_connect(id).await })
-        };
-        n0_future::time::sleep(Duration::from_millis(800)).await;
-        pool.close(id).await.expect("close failed");
-        let first = first.await.expect("join failed");
-        assert!(
-            matches!(first, Err(PoolConnectError::Closed { .. })),
-            "in-flight connect after close: {first:?}"
-        );
-        let second = pool.get_or_connect(id).await;
-        assert!(second.is_ok(), "pool unusable after close: {second:?}");
-        drop(second);
-        shutdown_routers(routers).await;
-        endpoint.close().await;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn close_then_immediate_reconnect() -> TestResult<()> {
-        let (ids, routers, address_lookup) = echo_servers(1).await?;
-        let id = ids[0];
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup)
-            .bind()
-            .await?;
-        let pool = ConnectionPool::new(endpoint.clone(), ECHO_ALPN, test_options());
-        let conn1 = pool.get_or_connect(id).await?;
-        let cid1 = conn1.stable_id();
-        pool.close(id).await.expect("close failed");
-        let conn2 = pool
-            .get_or_connect(id)
-            .await
-            .unwrap_or_else(|e| panic!("reconnect after close failed: {e:?}"));
-        assert_ne!(conn2.stable_id(), cid1);
-        let msg = b"after close";
-        assert_eq!(echo_client(&conn2, msg).await?, msg);
-        drop(conn1);
-        drop(conn2);
-        shutdown_routers(routers).await;
-        endpoint.close().await;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dropping_old_ref_does_not_close_new_connection() -> TestResult<()> {
-        let (ids, routers, address_lookup) = echo_servers(1).await?;
-        let id = ids[0];
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup)
-            .bind()
-            .await?;
-        let pool = ConnectionPool::new(
-            endpoint.clone(),
-            ECHO_ALPN,
-            Options {
-                idle_timeout: Duration::from_millis(50),
-                ..test_options()
-            },
-        );
-        let conn1 = pool.get_or_connect(id).await?;
-        pool.close(id).await.expect("close failed");
-        let conn2 = pool.get_or_connect(id).await?;
-        drop(conn1);
-        n0_future::time::sleep(Duration::from_millis(200)).await;
-        let msg = b"still alive";
-        assert_eq!(echo_client(&conn2, msg).await?, msg);
-        drop(conn2);
-        shutdown_routers(routers).await;
-        endpoint.close().await;
-        Ok(())
-    }
-
-    /// Closing a slow connection attempt discards it. A later connect starts
-    /// a new attempt.
+    /// Closing a slow connection attempt fails it, and discards its result.
+    ///
+    /// A later request starts a new attempt rather than taking the stale one.
     #[tokio::test]
     async fn stale_connect_result_is_discarded() -> TestResult<()> {
-        let (ids, routers, address_lookup) = echo_servers(1).await?;
-        let id = ids[0];
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup)
-            .bind()
-            .await?;
+        let net = EchoNet::new(1).await?;
+        let id = net.ids[0];
         let handshake = Duration::from_millis(1000);
-        let pool = ConnectionPool::new(
-            endpoint.clone(),
-            ECHO_ALPN,
-            test_options().with_on_connected(move |_, _| async move {
-                n0_future::time::sleep(handshake).await;
-                Ok(())
-            }),
-        );
-        let first = {
-            let pool = pool.clone();
-            n0_future::task::spawn(async move { pool.get_or_connect(id).await })
-        };
+        let (options, _) = scripted(test_options(), move |_| (handshake, true));
+        let pool = net.pool(options);
+        let first = spawn_get(&pool, id);
         n0_future::time::sleep(Duration::from_millis(800)).await;
-        pool.close(id).await.expect("close failed");
+        pool.close(id).await?;
         n0_future::time::sleep(Duration::from_millis(10)).await;
-        let t = std::time::Instant::now();
-        let second = pool.get_or_connect(id).await;
-        let elapsed = t.elapsed();
-        let first = first.await.expect("join failed");
-        assert!(matches!(first, Err(PoolConnectError::Closed { .. })));
-        assert!(second.is_ok(), "second connect failed: {second:?}");
+
+        let start = Instant::now();
+        pool.get_or_connect(id).await?;
+        let elapsed = start.elapsed();
+        assert_err!(first.await?, Closed);
         assert!(
             elapsed >= Duration::from_millis(900),
-            "second connect completed in {elapsed:?}, served by a stale connect attempt"
+            "served by the stale attempt after {elapsed:?}"
         );
-        drop(second);
-        shutdown_routers(routers).await;
-        endpoint.close().await;
+        net.shutdown().await;
         Ok(())
     }
 
-    /// Check that when a connection is closed, the pool will give you a new
-    /// connection next time you want one.
+    /// After `close`, a request gets a new connection, and the old one's references leave it alone.
+    #[tokio::test]
+    async fn close_then_reconnect() -> TestResult<()> {
+        let net = EchoNet::new(1).await?;
+        let id = net.ids[0];
+        let pool = net.pool(Options {
+            idle_timeout: Duration::from_millis(50),
+            ..test_options()
+        });
+        let old = pool.get_or_connect(id).await?;
+        pool.close(id).await?;
+        let new = pool.get_or_connect(id).await?;
+        assert_ne!(new.stable_id(), old.stable_id());
+        drop(old);
+        n0_future::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(echo(&new, b"still alive").await?, b"still alive");
+        net.shutdown().await;
+        Ok(())
+    }
+
+    /// A closed connection is replaced on the next request.
     #[tokio::test]
     async fn watch_close() -> TestResult<()> {
-        let n = 1;
-        let (ids, routers, address_lookup) = echo_servers(n).await?;
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup)
-            .bind()
-            .await?;
-
-        let pool = ConnectionPool::new(endpoint.clone(), ECHO_ALPN, test_options());
-        let conn = pool.get_or_connect(ids[0]).await?;
-        let cid1 = conn.stable_id();
+        let net = EchoNet::new(1).await?;
+        let pool = net.pool(test_options());
+        let conn = pool.get_or_connect(net.ids[0]).await?;
         conn.close(0u32.into(), b"test");
         n0_future::time::sleep(Duration::from_millis(500)).await;
-        let conn = pool.get_or_connect(ids[0]).await?;
-        let cid2 = conn.stable_id();
-        assert_ne!(cid1, cid2);
-        shutdown_routers(routers).await;
-        endpoint.close().await;
+        let again = pool.get_or_connect(net.ids[0]).await?;
+        assert_ne!(again.stable_id(), conn.stable_id());
+        net.shutdown().await;
         Ok(())
     }
 
     /// In-flight attempts do not count towards [`Options::max_connections`].
     ///
     /// Otherwise peers we are still trying to reach take every slot, and
-    /// unrelated peers fail with `TooManyConnections` until `connect_timeout`
-    /// expires.
+    /// unrelated peers fail until `connect_timeout` expires.
     #[tokio::test]
     async fn inflight_connects_do_not_exhaust_slots() -> TestResult<()> {
-        let (live_ids, routers, address_lookup) = echo_servers(1).await?;
-        let live_peer = live_ids[0];
-
+        let net = EchoNet::new(1).await?;
         let max_connections = 2;
-        let mut dead = Vec::new();
-        let mut _socks = Vec::new();
-        for i in 0..max_connections {
-            let (sock, addr) = dead_addr()?;
-            _socks.push(sock);
-            let id = SecretKey::from_bytes(&[20 + i as u8; 32]).public();
-            address_lookup.add_endpoint_info(EndpointAddr {
-                id,
-                addrs: vec![addr].into_iter().collect(),
-            });
-            dead.push(id);
-        }
-
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup)
-            .bind()
-            .await?;
-        let pool = ConnectionPool::new(
-            endpoint.clone(),
-            ECHO_ALPN,
-            Options {
-                connect_timeout: Duration::from_secs(5),
-                max_connections,
-                ..test_options()
-            },
-        );
-
-        // Park the pool at its connection limit with attempts that neither
-        // succeed nor fail until connect_timeout expires.
+        let pool = net.pool(Options {
+            max_connections,
+            ..test_options()
+        });
         let mut parked = Vec::new();
-        for id in dead {
-            let pool = pool.clone();
-            parked.push(n0_future::task::spawn(async move {
-                pool.get_or_connect(id).await
-            }));
+        for seed in 0..max_connections {
+            let (sock, dead) = net.dead_peer(20 + seed as u8)?;
+            parked.push((sock, spawn_get(&pool, dead)));
         }
         n0_future::time::sleep(Duration::from_millis(100)).await;
 
-        let res = pool.get_or_connect(live_peer).await;
-        assert!(
-            res.is_ok(),
-            "unrelated peer rejected while pool holds no connections: {res:?}"
-        );
-        drop(res);
-
-        // Let the parked attempts finish before tearing the endpoint down.
-        for p in parked {
-            let _ = p.await;
+        pool.get_or_connect(net.ids[0]).await?;
+        for (_sock, attempt) in parked {
+            let _ = attempt.await;
         }
-        shutdown_routers(routers).await;
-        endpoint.close().await;
+        net.shutdown().await;
         Ok(())
     }
 
     /// A connection made after the pool filled up fails with `TooManyConnections`.
     ///
-    /// Attempts no longer reserve a slot, so without a second check the pool
-    /// would go over `max_connections`.
+    /// Attempts do not reserve a slot, so without a second check the pool would
+    /// go over `max_connections`.
     #[tokio::test]
     async fn connect_into_a_full_pool_fails() -> TestResult<()> {
-        let (ids, routers, address_lookup) = echo_servers(2).await?;
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup)
-            .bind()
-            .await?;
-        let pool = ConnectionPool::new(
-            endpoint.clone(),
-            ECHO_ALPN,
-            Options {
-                max_connections: 1,
-                ..test_options()
-            },
+        let net = EchoNet::new(2).await?;
+        let pool = net.pool(Options {
+            max_connections: 1,
+            ..test_options()
+        });
+        let (a, b) = tokio::join!(
+            pool.get_or_connect(net.ids[0]),
+            pool.get_or_connect(net.ids[1])
         );
-        // Both attempts start before either connection exists.
-        let (a, b) = tokio::join!(pool.get_or_connect(ids[0]), pool.get_or_connect(ids[1]));
         let full = |res: &Result<_, PoolConnectError>| {
             matches!(res, Err(PoolConnectError::TooManyConnections { .. }))
         };
@@ -1484,212 +1949,725 @@ mod tests {
             "expected one connection and one TooManyConnections: {a:?}, {b:?}"
         );
         drop((a, b));
-        shutdown_routers(routers).await;
-        endpoint.close().await;
-        Ok(())
-    }
-
-    /// A stale close event leaves the current connection alone.
-    ///
-    /// The event is for a connection the peer no longer has. The pool closes a
-    /// connection before it replaces it, and polls close events before its
-    /// inbox, so this cannot happen through the public API yet. The test calls
-    /// the handler directly.
-    #[tokio::test]
-    async fn stale_close_event_keeps_the_current_connection() -> TestResult<()> {
-        let (ids, routers, address_lookup) = echo_servers(1).await?;
-        let id = ids[0];
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup)
-            .bind()
-            .await?;
-        let conn = endpoint.connect(id, ECHO_ALPN).await?;
-        let (mut actor, _tx) = Actor::new(endpoint.clone(), ECHO_ALPN, test_options());
-        let conn_id = insert_ready(&mut actor, &conn);
-
-        actor.handle_conn_closed(stale_conn_id(id));
-        assert!(
-            actor.peers.contains_key(&id),
-            "a stale close event removed the peer"
-        );
-        assert!(
-            conn.close_reason().is_none(),
-            "a stale close event closed the connection"
-        );
-        actor.handle_conn_closed(conn_id);
-        assert!(!actor.peers.contains_key(&id));
-
-        shutdown_routers(routers).await;
-        endpoint.close().await;
-        Ok(())
-    }
-
-    /// A connection that has closed is not handed out.
-    ///
-    /// The pool learns of a close through a watcher, so a connection can be
-    /// closed while it is still the peer's current one. A request that lands in
-    /// that window gets a new connection.
-    #[tokio::test]
-    async fn closed_connection_is_not_handed_out() -> TestResult<()> {
-        let (ids, routers, address_lookup) = echo_servers(1).await?;
-        let id = ids[0];
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup)
-            .bind()
-            .await?;
-        let conn = endpoint.connect(id, ECHO_ALPN).await?;
-        let (mut actor, _tx) = Actor::new(endpoint.clone(), ECHO_ALPN, test_options());
-        insert_ready(&mut actor, &conn);
-        // The pool has not handled the close event yet.
-        conn.close(0u32.into(), b"gone");
-        conn.closed().await;
-
-        let (tx, mut rx) = oneshot::channel();
-        actor.handle_request(RequestRef { id, tx });
-        assert!(
-            rx.try_recv().is_err(),
-            "the closed connection was handed out"
-        );
-        assert!(
-            matches!(actor.peers.get(&id), Some(PeerState::Connecting { .. })),
-            "the request did not start a new connection"
-        );
-
-        shutdown_routers(routers).await;
-        endpoint.close().await;
-        Ok(())
-    }
-
-    /// A connection whose `on_connected` failed is closed.
-    ///
-    /// Dropping it would not be enough: the callback may keep a handle to it.
-    #[tokio::test]
-    async fn on_connected_error_closes_the_connection() -> TestResult<()> {
-        let (ids, routers, address_lookup) = echo_servers(1).await?;
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup)
-            .bind()
-            .await?;
-        let kept = Arc::new(std::sync::Mutex::new(None));
-        let pool = ConnectionPool::new(
-            endpoint.clone(),
-            ECHO_ALPN,
-            test_options().with_on_connected({
-                let kept = kept.clone();
-                move |_, conn: Connection| {
-                    *kept.lock().expect("poisoned") = Some(conn);
-                    async { Err(io::Error::other("on_connect failed")) }
-                }
-            }),
-        );
-        let res = pool.get_or_connect(ids[0]).await;
-        assert!(matches!(res, Err(PoolConnectError::OnConnectError { .. })));
-        let conn = kept
-            .lock()
-            .expect("poisoned")
-            .take()
-            .expect("callback not called");
-        assert!(
-            conn.close_reason().is_some(),
-            "the connection stayed open after on_connected failed"
-        );
-        shutdown_routers(routers).await;
-        endpoint.close().await;
+        net.shutdown().await;
         Ok(())
     }
 
     /// Using a connection again restarts its idle timeout.
-    ///
-    /// The connection is closed `idle_timeout` after it last went unused, not
-    /// after it first did.
     #[tokio::test]
     async fn use_restarts_the_idle_timeout() -> TestResult<()> {
-        let (ids, routers, address_lookup) = echo_servers(1).await?;
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup)
-            .bind()
-            .await?;
+        let net = EchoNet::new(1).await?;
         let idle_timeout = Duration::from_millis(500);
-        let kept = Arc::new(std::sync::Mutex::new(None));
-        let pool = ConnectionPool::new(
-            endpoint.clone(),
-            ECHO_ALPN,
-            Options {
-                idle_timeout,
-                ..test_options()
-            }
-            .with_on_connected({
-                let kept = kept.clone();
-                move |_, conn: Connection| {
-                    *kept.lock().expect("poisoned") = Some(conn);
-                    async { Ok(()) }
-                }
-            }),
-        );
-        drop(pool.get_or_connect(ids[0]).await?);
-        let conn = kept
-            .lock()
-            .expect("poisoned")
-            .take()
-            .expect("callback not called");
+        let pool = net.pool(Options {
+            idle_timeout,
+            ..test_options()
+        });
+        let conn = pool.get_or_connect(net.ids[0]).await?.downgrade();
 
         n0_future::time::sleep(idle_timeout * 3 / 5).await;
-        drop(pool.get_or_connect(ids[0]).await?);
+        drop(pool.get_or_connect(net.ids[0]).await?);
         // Past the first timeout, within the second.
         n0_future::time::sleep(idle_timeout * 3 / 5).await;
-        assert!(
-            conn.close_reason().is_none(),
-            "closed before its restarted timeout"
-        );
-        // Past the second.
+        assert!(conn.close_reason().is_none(), "closed before its timeout");
         n0_future::time::sleep(idle_timeout * 4 / 5).await;
         assert!(
             conn.close_reason().is_some(),
             "not closed after its timeout"
         );
+        net.shutdown().await;
+        Ok(())
+    }
 
-        shutdown_routers(routers).await;
-        endpoint.close().await;
+    /// A stale close event leaves the current connection alone.
+    ///
+    /// A request that finds the current connection closed removes it before its
+    /// close event arrives, so the event is stale then.
+    #[tokio::test]
+    async fn stale_close_event_keeps_the_current_connection() -> TestResult<()> {
+        let mut h = Held::new(test_options()).await?;
+        let peer = h.conn_id.peer;
+        h.actor.handle_conn_closed(h.stale_id());
+        assert!(h.actor.peers.contains_key(&peer), "removed the peer");
+        assert!(h.conn.close_reason().is_none(), "closed the connection");
+        h.actor.handle_conn_closed(h.conn_id);
+        assert!(!h.actor.peers.contains_key(&peer));
+        assert_eq!(h.actor.connection_count(), 0);
+        Ok(())
+    }
+
+    /// A connection that has closed is not handed out, though its close event is pending.
+    #[tokio::test]
+    async fn closed_connection_is_not_handed_out() -> TestResult<()> {
+        let mut h = Held::new(test_options()).await?;
+        let id = h.conn_id.peer;
+        h.conn.close(0u32.into(), b"gone");
+        h.conn.closed().await;
+
+        let (tx, mut rx) = oneshot::channel();
+        h.actor.handle_request(RequestRef { id, tx });
+        assert!(rx.try_recv().is_err(), "handed out the closed connection");
+        let peer = h.actor.peers.get(&id).expect("dropped the peer");
+        assert!(peer.current.is_none(), "kept the closed connection");
+        assert_eq!(peer.attempts.len(), 1, "did not start a new connection");
         Ok(())
     }
 
     /// A stale unused event leaves the current connection's idle time alone.
     ///
-    /// The event is for a connection the peer no longer has. References to a
-    /// replaced connection can outlive it, and when the last one drops, its
-    /// event names the peer, whose current connection is another.
+    /// References to a replaced connection can outlive it, and their last drop
+    /// names that connection.
     #[tokio::test]
     async fn stale_unused_event_keeps_the_idle_time() -> TestResult<()> {
-        let (ids, routers, address_lookup) = echo_servers(1).await?;
-        let id = ids[0];
-        let endpoint = iroh::Endpoint::builder(presets::Minimal)
-            .relay_mode(RelayMode::Default)
-            .address_lookup(address_lookup)
+        let mut h = Held::new(test_options()).await?;
+        let since = h.actor.unused.oldest().expect("the connection is unused");
+        h.actor.handle_unused_event(h.stale_id());
+        assert_eq!(
+            h.actor.unused.oldest(),
+            Some(since),
+            "restarted the timeout"
+        );
+        // Taken off the list as if handed out, its own event lists it again.
+        h.actor.unused.remove(h.conn_id);
+        h.actor.handle_unused_event(h.conn_id);
+        assert!(h.actor.unused.oldest().is_some(), "ignored its own event");
+        Ok(())
+    }
+
+    /// The idle timeout does not close a connection that was upgraded meanwhile.
+    #[tokio::test]
+    async fn close_unused_keeps_an_upgraded_connection() -> TestResult<()> {
+        let options = test_options();
+        let idle_timeout = options.idle_timeout;
+        let mut h = Held::new(options).await?;
+        let _upgraded = h.upgrade();
+        n0_future::time::sleep(idle_timeout * 2).await;
+        h.actor.close_unused();
+        h.assert_kept();
+        Ok(())
+    }
+
+    /// A full pool does not evict a connection that was upgraded meanwhile.
+    #[tokio::test]
+    async fn make_room_keeps_an_upgraded_connection() -> TestResult<()> {
+        let mut h = Held::new(Options {
+            max_connections: 1,
+            ..test_options()
+        })
+        .await?;
+        let _upgraded = h.upgrade();
+        assert!(!h.actor.make_room(), "made room in a pool that is in use");
+        h.assert_kept();
+        Ok(())
+    }
+
+    /// Requests whose callers gave up do not pile up on a running attempt.
+    #[tokio::test]
+    async fn cancelled_requests_do_not_pile_up() -> TestResult<()> {
+        let mut h = Held::new(test_options()).await?;
+        let peer = SecretKey::from_bytes(&[6u8; 32]).public();
+        for _ in 0..10 {
+            let (tx, rx) = oneshot::channel();
+            drop(rx);
+            h.actor.handle_request(RequestRef { id: peer, tx });
+        }
+        let attempt = h
+            .actor
+            .peers
+            .get(&peer)
+            .and_then(|peer| peer.attempts.last())
+            .expect("no attempt");
+        assert_eq!(attempt.requests.len(), 1, "kept requests of gone callers");
+        h.net.server.close().await;
+        Ok(())
+    }
+
+    /// An upgrade and the pool retiring an unused connection cannot both succeed.
+    #[test]
+    fn upgrade_and_unused_close_exclude_each_other() {
+        let peer = SecretKey::from_bytes(&[4u8; 32]).public();
+        let conn_id = ConnId {
+            peer,
+            generation: Generation(0),
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let counter = ConnectionCounter::new(conn_id, tx);
+
+        let permit = counter.inner.try_get_one().expect("open connection");
+        assert!(!counter.try_retire_unused(), "retired a connection in use");
+        drop(permit);
+        assert!(counter.try_retire_unused());
+        assert!(
+            counter.inner.try_get_one().is_none(),
+            "upgraded a retired one"
+        );
+        assert!(!counter.try_retire_unused(), "retired twice");
+    }
+
+    /// The last reference to drop reports which connection went unused.
+    #[test]
+    fn the_last_reference_reports_the_connection_unused() {
+        let peer = SecretKey::from_bytes(&[5u8; 32]).public();
+        let conn_id = ConnId {
+            peer,
+            generation: Generation(7),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let counter = ConnectionCounter::new(conn_id, tx);
+
+        let permit = counter.get_one();
+        let clone = permit.clone();
+        drop(permit);
+        assert!(rx.try_recv().is_err(), "reported unused while in use");
+        drop(clone);
+        assert_eq!(rx.try_recv().ok(), Some(conn_id));
+    }
+
+    /// A full pool does not adopt a connection from a peer it is dialing.
+    ///
+    /// A dial holds no slot, so the room check has to run when the adoption
+    /// finishes, whatever state the peer is in.
+    #[tokio::test]
+    async fn adopting_for_a_dialing_peer_respects_max_connections() -> TestResult<()> {
+        let net = Incoming::new(Options {
+            max_connections: 1,
+            connect_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(10),
+            ..Default::default()
+        })
+        .await?;
+        let second = Endpoint::bind(presets::Minimal).await?;
+        let (_dead_sock, dead) = dead_addr()?;
+        let lookup = MemoryLookup::new();
+        lookup.add_endpoint_info(EndpointAddr::from_parts(second.id(), [dead]));
+        net.server.address_lookup()?.add(lookup);
+
+        let dial = spawn_get(&net.pool, second.id());
+        n0_future::time::sleep(Duration::from_millis(300)).await;
+        assert!(!dial.is_finished(), "the dial finished early");
+        // One connection in use fills the pool.
+        let (first, _first_ref) = net.adopt().await?;
+
+        let (_outgoing, incoming) = net.pair_from(&second).await?;
+        assert_err!(
+            net.pool.handle_connection(incoming).await,
+            TooManyConnections
+        );
+        assert!(
+            first.close_reason().is_none(),
+            "closed the connection in use"
+        );
+        dial.abort();
+        net.server.close().await;
+        Ok(())
+    }
+
+    /// Handing the pool a connection it is already adopting waits for that.
+    #[tokio::test]
+    async fn adopting_one_connection_twice_waits_for_the_first() -> TestResult<()> {
+        let (options, seen) = slow(Duration::from_millis(300));
+        let net = Incoming::new(options).await?;
+        let (outgoing, incoming) = net.pair().await?;
+
+        let (first, second) = tokio::join!(
+            net.pool.handle_connection(incoming.clone()),
+            net.pool.handle_connection(incoming),
+        );
+        let (first, second) = (first?, second?);
+        assert_eq!(first.stable_id(), second.stable_id(), "not one connection");
+        assert_eq!(seen.lock().expect("poisoned").len(), 1, "adopted twice");
+        assert!(!first.is_superseded(), "superseded by itself");
+
+        // One counter, so dropping one reference leaves the other's use alone.
+        drop(first);
+        n0_future::time::sleep(SHORT_IDLE * 5).await;
+        assert!(outgoing.close_reason().is_none(), "closed while in use");
+        net.server.close().await;
+        Ok(())
+    }
+
+    /// Handing the pool a connection it superseded returns it, still superseded.
+    #[tokio::test]
+    async fn adopting_a_superseded_connection_returns_it() -> TestResult<()> {
+        let s = Superseded::new(short_idle_options()).await?;
+        let again = s.net.pool.handle_connection((*s.first_ref).clone()).await?;
+        assert_eq!(again.stable_id(), s.first_ref.stable_id());
+        assert!(
+            again.is_superseded(),
+            "made a superseded connection current"
+        );
+        assert_eq!(s.net.current().await?.stable_id(), s.second_ref.stable_id());
+        s.net.server.close().await;
+        Ok(())
+    }
+
+    /// A connection that closes during its adoption does not become current.
+    #[tokio::test]
+    async fn a_connection_that_closes_while_adopted_is_not_current() -> TestResult<()> {
+        let (options, _) = slow(Duration::from_millis(300));
+        let net = Incoming::new(options).await?;
+        let (_first, first_ref) = net.adopt().await?;
+
+        let (outgoing, incoming) = net.pair().await?;
+        let adopting = net.spawn_adopt(incoming.clone());
+        n0_future::time::sleep(Duration::from_millis(50)).await;
+        outgoing.close(0u32.into(), b"gone");
+
+        assert_err!(adopting.await?, Closed);
+        assert!(
+            !first_ref.is_superseded(),
+            "superseded by a closed connection"
+        );
+        assert_eq!(net.current().await?.stable_id(), first_ref.stable_id());
+        // Once it has closed, it is refused right away.
+        assert_err!(net.pool.handle_connection(incoming).await, Closed);
+        net.server.close().await;
+        Ok(())
+    }
+
+    /// An adoption that finishes after a newer one does not replace it.
+    #[tokio::test]
+    async fn an_older_adoption_that_finishes_last_is_superseded() -> TestResult<()> {
+        let (options, _) = scripted(short_idle_options(), |n| {
+            let delay = if n == 0 { 500 } else { 0 };
+            (Duration::from_millis(delay), true)
+        });
+        let net = Incoming::new(options).await?;
+        let (_older, older) = net.pair().await?;
+        let (_newer, newer) = net.pair().await?;
+
+        let older = net.spawn_adopt(older);
+        n0_future::time::sleep(Duration::from_millis(50)).await;
+        let newer = net.pool.handle_connection(newer).await?;
+        let older = older.await??;
+        assert!(older.is_superseded(), "the older connection is current");
+        assert!(!newer.is_superseded(), "an older connection superseded it");
+        assert_eq!(net.current().await?.stable_id(), newer.stable_id());
+        net.server.close().await;
+        Ok(())
+    }
+
+    /// A request waits for a running adoption instead of dialing.
+    #[tokio::test]
+    async fn a_request_waits_for_a_running_adoption() -> TestResult<()> {
+        let (options, seen) = slow(Duration::from_millis(300));
+        let net = Incoming::new(options).await?;
+        let (_outgoing, incoming) = net.pair().await?;
+        let adopting = net.spawn_adopt(incoming);
+        n0_future::time::sleep(Duration::from_millis(50)).await;
+
+        // The pool has no address for the client, so a dial would fail.
+        let requested = net.current().await?;
+        assert_eq!(requested.stable_id(), adopting.await??.stable_id());
+        assert_eq!(seen.lock().expect("poisoned").len(), 1, "dialed as well");
+        net.server.close().await;
+        Ok(())
+    }
+
+    /// A request gets the first connection that is ready, though it joined a newer attempt.
+    #[tokio::test]
+    async fn a_request_gets_the_first_connection_ready() -> TestResult<()> {
+        let (options, _) = scripted(short_idle_options(), |n| match n {
+            0 => (Duration::from_millis(300), true),
+            _ => (Duration::from_millis(600), false),
+        });
+        let net = Incoming::new(options).await?;
+        let (_first, first) = net.pair().await?;
+        let (_second, second) = net.pair().await?;
+        let first = net.spawn_adopt(first);
+        n0_future::time::sleep(Duration::from_millis(50)).await;
+        let second = net.spawn_adopt(second);
+        n0_future::time::sleep(Duration::from_millis(50)).await;
+
+        // Nothing is ready yet, so the request joins the newest adoption.
+        let requested = net.current().await?;
+        assert_eq!(requested.stable_id(), first.await??.stable_id());
+        assert_err!(second.await?, OnConnectError);
+        net.server.close().await;
+        Ok(())
+    }
+
+    /// A request whose adoption fails is handled again, rather than failing with it.
+    #[tokio::test]
+    async fn a_request_is_handled_again_when_its_adoption_fails() -> TestResult<()> {
+        let options = Options {
+            connect_timeout: Duration::from_millis(200),
+            ..short_idle_options()
+        };
+        let (options, _) = scripted(options, |_| (Duration::from_millis(300), false));
+        let net = Incoming::new(options).await?;
+        let (_outgoing, incoming) = net.pair().await?;
+        let adopting = net.spawn_adopt(incoming);
+        n0_future::time::sleep(Duration::from_millis(50)).await;
+
+        // Handled again, the request dials the client, which does not answer.
+        let res = net.current().await;
+        assert!(
+            matches!(
+                res,
+                Err(PoolConnectError::ConnectError { .. } | PoolConnectError::Timeout { .. })
+            ),
+            "expected a dial error: {res:?}"
+        );
+        assert_err!(adopting.await?, OnConnectError);
+        net.server.close().await;
+        Ok(())
+    }
+
+    /// An adoption that `on_connected` rejects leaves the current connection.
+    #[tokio::test]
+    async fn a_rejected_adoption_keeps_the_current_connection() -> TestResult<()> {
+        let (options, seen) = scripted(short_idle_options(), |n| (Duration::ZERO, n == 0));
+        let net = Incoming::new(options).await?;
+        let (_first, first_ref) = net.adopt().await?;
+
+        let (outgoing, incoming) = net.pair().await?;
+        assert_err!(net.pool.handle_connection(incoming).await, OnConnectError);
+        let err = tokio::time::timeout(SHORT_IDLE * 5, outgoing.closed()).await?;
+        assert_closed_as(&err, CloseReason::Rejected);
+        let rejected = seen.lock().expect("poisoned").pop().expect("not called");
+        assert!(
+            rejected.upgrade().is_none(),
+            "upgraded a rejected connection"
+        );
+        assert!(!first_ref.is_superseded(), "superseded by a rejected one");
+        assert_eq!(net.current().await?.stable_id(), first_ref.stable_id());
+        net.server.close().await;
+        Ok(())
+    }
+
+    /// Closing a peer closes the connection of an adoption that is running.
+    #[tokio::test]
+    async fn close_closes_the_connection_of_a_running_attempt() -> TestResult<()> {
+        let (options, _) = slow(Duration::from_secs(10));
+        let net = Incoming::new(options).await?;
+        let (outgoing, incoming) = net.pair().await?;
+        let adopting = net.spawn_adopt(incoming);
+        n0_future::time::sleep(Duration::from_millis(100)).await;
+
+        net.pool.close(net.client.id()).await?;
+        let err = tokio::time::timeout(Duration::from_secs(5), outgoing.closed()).await?;
+        assert_closed_as(&err, CloseReason::Closed);
+        assert_err!(adopting.await?, Closed);
+        net.server.close().await;
+        Ok(())
+    }
+
+    /// The pool keeps at most `max_superseded_per_peer` superseded connections.
+    #[tokio::test]
+    async fn superseded_connections_are_capped() -> TestResult<()> {
+        let net = Incoming::new(Options {
+            max_superseded_per_peer: 1,
+            ..short_idle_options()
+        })
+        .await?;
+        // The references keep each one in use, so none closes for being unused.
+        let mut adopted = Vec::new();
+        for _ in 0..3 {
+            adopted.push(net.adopt().await?);
+        }
+        let err = tokio::time::timeout(SHORT_IDLE * 5, adopted[0].0.closed()).await?;
+        assert_closed_as(&err, CloseReason::Superseded);
+        assert!(
+            adopted[1].0.close_reason().is_none(),
+            "closed one within the cap"
+        );
+        assert!(
+            adopted[2].0.close_reason().is_none(),
+            "closed the current one"
+        );
+        net.server.close().await;
+        Ok(())
+    }
+
+    /// A full pool adopts a connection when the superseded cap makes room for it.
+    #[tokio::test]
+    async fn adopting_at_the_superseded_cap_fits_a_full_pool() -> TestResult<()> {
+        let net = Incoming::new(Options {
+            max_connections: 2,
+            max_superseded_per_peer: 1,
+            ..short_idle_options()
+        })
+        .await?;
+        // Two connections in use fill the pool, and put the peer at its cap.
+        let (oldest, _oldest_ref) = net.adopt().await?;
+        let (middle, _middle_ref) = net.adopt().await?;
+
+        let (_newest, newest) = net.adopt().await?;
+        assert!(!newest.is_superseded(), "the adoption is not current");
+        tokio::time::timeout(SHORT_IDLE * 5, oldest.closed()).await?;
+        assert!(middle.close_reason().is_none(), "closed one within the cap");
+        net.server.close().await;
+        Ok(())
+    }
+
+    /// A dial that connects after its peer was closed skips `on_connected`, and is closed.
+    #[tokio::test]
+    async fn a_dial_that_connects_after_close_is_closed_when_it_ends() -> TestResult<()> {
+        let net = Incoming::new(Options::default()).await?;
+        let (options, seen) = slow(Duration::from_secs(10));
+        net.client
+            .address_lookup()?
+            .add(MemoryLookup::from_endpoint_info([net.server.addr()]));
+        let pool = ConnectionPool::new(net.client.clone(), INCOMING_ALPN, options);
+
+        let dial = spawn_get(&pool, net.server.id());
+        // The handshake waits for the server, so the dial is still connecting.
+        let incoming = net.server.accept().await.expect("endpoint closed");
+        pool.close(net.server.id()).await?;
+        n0_future::time::sleep(Duration::from_millis(50)).await;
+        let connection = incoming.await?;
+
+        assert_err!(dial.await?, Closed);
+        let err = tokio::time::timeout(SHORT_IDLE * 5, connection.closed()).await?;
+        assert_closed_as(&err, CloseReason::Closed);
+        assert!(
+            seen.lock().expect("poisoned").is_empty(),
+            "ran on_connected"
+        );
+        net.server.close().await;
+        Ok(())
+    }
+
+    /// An incoming connection becomes the one `get_or_connect` returns.
+    #[tokio::test]
+    async fn handle_connection_becomes_current() -> TestResult<()> {
+        let s = Superseded::new(short_idle_options()).await?;
+        let conn = s.net.current().await?;
+        assert_eq!(conn.stable_id(), s.second_ref.stable_id());
+        assert!(!conn.is_superseded());
+        assert!(s.first_ref.is_superseded());
+        s.net.server.close().await;
+        Ok(())
+    }
+
+    /// A superseded connection stays open while in use, and closes once unused.
+    #[tokio::test]
+    async fn superseded_connection_is_closed_once_unused() -> TestResult<()> {
+        let s = Superseded::new(short_idle_options()).await?;
+        n0_future::time::sleep(SHORT_IDLE * 5).await;
+        assert!(s.first.close_reason().is_none(), "closed while in use");
+
+        drop(s.first_ref);
+        let err = tokio::time::timeout(SHORT_IDLE * 10, s.first.closed()).await?;
+        assert_closed_as(&err, CloseReason::Unused);
+        assert!(s.second.close_reason().is_none(), "closed the current one");
+        Ok(())
+    }
+
+    /// A reference kept from `on_connected` keeps a superseded connection open.
+    #[tokio::test]
+    async fn on_connected_ref_keeps_superseded_connection_open() -> TestResult<()> {
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let options = short_idle_options().with_on_connected({
+            let kept = kept.clone();
+            move |_, conn: ConnectionRef| {
+                kept.lock().expect("poisoned").push(conn.clone());
+                async { Ok(()) }
+            }
+        });
+        let s = Superseded::new(options).await?;
+        drop(s.first_ref);
+        drop(s.second_ref);
+
+        n0_future::time::sleep(SHORT_IDLE * 5).await;
+        assert!(s.first.close_reason().is_none(), "closed while kept");
+        kept.lock().expect("poisoned").clear();
+        let err = tokio::time::timeout(SHORT_IDLE * 10, s.first.closed()).await?;
+        assert_closed_as(&err, CloseReason::Unused);
+        Ok(())
+    }
+
+    /// [`ConnectionPool::close`] closes superseded connections, even in use.
+    #[tokio::test]
+    async fn close_closes_superseded_connections() -> TestResult<()> {
+        let s = Superseded::new(short_idle_options()).await?;
+        s.net.pool.close(s.net.client.id()).await?;
+        for (name, conn) in [("superseded", &s.first), ("current", &s.second)] {
+            let err = tokio::time::timeout(SHORT_IDLE * 2, conn.closed())
+                .await
+                .map_err(|_| format!("the {name} connection was not closed"))?;
+            assert_closed_as(&err, CloseReason::Dropped);
+        }
+        Ok(())
+    }
+
+    /// An incoming connection serves the waiters of a running dial, and outlives it.
+    ///
+    /// This is an endpoint that can dial us, but that we cannot dial.
+    #[tokio::test]
+    async fn incoming_connection_serves_a_running_dial() -> TestResult<()> {
+        let net = Incoming::new(Options {
+            connect_timeout: Duration::from_millis(500),
+            ..short_idle_options()
+        })
+        .await?;
+        // TEST-NET-1: nothing answers, so the dial runs until its timeout.
+        let lookup = MemoryLookup::new();
+        lookup.add_endpoint_info(EndpointAddr::from_parts(
+            net.client.id(),
+            [TransportAddr::Ip("192.0.2.1:1".parse()?)],
+        ));
+        net.server.address_lookup()?.add(lookup);
+        let dial = spawn_get(&net.pool, net.client.id());
+        n0_future::time::sleep(Duration::from_millis(100)).await;
+
+        let (outgoing, conn_ref) = net.adopt().await?;
+        assert_eq!(dial.await??.stable_id(), conn_ref.stable_id());
+        // Past the dial's timeout.
+        n0_future::time::sleep(Duration::from_millis(600)).await;
+        assert!(outgoing.close_reason().is_none(), "closed the adopted one");
+        assert_eq!(net.current().await?.stable_id(), conn_ref.stable_id());
+        net.server.close().await;
+        Ok(())
+    }
+
+    /// A dial that an adopted connection overtook becomes current once it connects.
+    ///
+    /// The peer adopts the dialed connection as its newest, so both ends agree
+    /// on it. The pool closed it once the dial ended, which cut off the
+    /// connection the peer used.
+    #[tokio::test]
+    async fn an_overtaken_dial_becomes_current() -> TestResult<()> {
+        let net = Incoming::new(short_idle_options()).await?;
+        let peer = Endpoint::builder(presets::Minimal)
+            .alpns(vec![INCOMING_ALPN.to_vec()])
             .bind()
             .await?;
-        let conn = endpoint.connect(id, ECHO_ALPN).await?;
-        let (mut actor, _tx) = Actor::new(endpoint.clone(), ECHO_ALPN, test_options());
-        let conn_id = insert_ready(&mut actor, &conn);
-        let since = actor.unused.oldest().expect("the connection is unused");
+        net.server
+            .address_lookup()?
+            .add(MemoryLookup::from_endpoint_info([peer.addr()]));
 
-        actor.handle_unused_event(stale_conn_id(id));
-        assert_eq!(
-            actor.unused.oldest(),
-            Some(since),
-            "a stale unused event restarted the idle timeout"
-        );
-        actor.handle_unused_event(conn_id);
+        let dial = spawn_get(&net.pool, peer.id());
+        // The handshake waits for the peer, so the dial is still connecting.
+        let dialed = peer.accept().await.expect("endpoint closed");
+        let (_outgoing, incoming) = net.pair_from(&peer).await?;
+        let adopted = net.pool.handle_connection(incoming).await?;
+        assert_eq!(dial.await??.stable_id(), adopted.stable_id());
+        let dialed = dialed.await?;
+
+        let current = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = net.pool.get_or_connect(peer.id()).await?;
+                if current.stable_id() != adopted.stable_id() {
+                    return Ok::<_, PoolConnectError>(current);
+                }
+                n0_future::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        assert_eq!(current.remote_id(), peer.id());
+        assert!(adopted.is_superseded(), "the adoption stayed current");
+        n0_future::time::sleep(SHORT_IDLE * 5).await;
+        assert!(dialed.close_reason().is_none(), "closed the overtaken dial");
+        peer.close().await;
+        net.server.close().await;
+        Ok(())
+    }
+
+    /// A superseded connection closing leaves the current one alone.
+    #[tokio::test]
+    async fn superseded_connection_closing_keeps_the_current_one() -> TestResult<()> {
+        let s = Superseded::new(short_idle_options()).await?;
+        // `first_ref` keeps it in use, so only its close event can retire it.
+        let first = s.first_ref.downgrade();
+        s.first.close(0u32.into(), b"bye");
+        until_retired(&first).await?;
+
+        assert!(s.second.close_reason().is_none(), "closed the current one");
+        assert_eq!(s.net.current().await?.stable_id(), s.second_ref.stable_id());
+        Ok(())
+    }
+
+    /// A slow `on_connected` for an incoming connection does not hold up requests.
+    #[tokio::test]
+    async fn slow_on_connected_for_incoming_keeps_serving() -> TestResult<()> {
+        let (options, _) = scripted(short_idle_options(), |n| {
+            let delay = if n == 0 { 0 } else { 3600 };
+            (Duration::from_secs(delay), true)
+        });
+        let net = Incoming::new(options).await?;
+        let (_first, first_ref) = net.adopt().await?;
+        let (_second, second) = net.pair().await?;
+        let second = net.spawn_adopt(second);
+        n0_future::time::sleep(Duration::from_millis(100)).await;
+
+        let current = tokio::time::timeout(Duration::from_secs(1), net.current())
+            .await
+            .map_err(|_| "the request waited for on_connected")??;
+        assert_eq!(current.stable_id(), first_ref.stable_id());
+        second.abort();
+        net.server.close().await;
+        Ok(())
+    }
+
+    /// A downgraded reference does not keep the connection open.
+    #[tokio::test]
+    async fn downgraded_ref_does_not_keep_connection_open() -> TestResult<()> {
+        let s = Superseded::new(short_idle_options()).await?;
+        let _weak = s.first_ref.downgrade();
+        drop(s.first_ref);
+        let err = tokio::time::timeout(SHORT_IDLE * 10, s.first.closed()).await?;
+        assert_closed_as(&err, CloseReason::Unused);
+        Ok(())
+    }
+
+    /// A clone of a [`ConnectionRef`] keeps the connection open on its own.
+    #[tokio::test]
+    async fn cloned_ref_keeps_connection_open() -> TestResult<()> {
+        let s = Superseded::new(short_idle_options()).await?;
+        let clone = s.first_ref.clone();
+        drop(s.first_ref);
+        n0_future::time::sleep(SHORT_IDLE * 5).await;
         assert!(
-            actor.unused.oldest().expect("still unused") >= since,
-            "the connection's own event was ignored"
+            s.first.close_reason().is_none(),
+            "closed while a clone lives"
         );
+        drop(clone);
+        let err = tokio::time::timeout(SHORT_IDLE * 10, s.first.closed()).await?;
+        assert_closed_as(&err, CloseReason::Unused);
+        Ok(())
+    }
 
-        shutdown_routers(routers).await;
-        endpoint.close().await;
+    /// Upgrading fails once the pool has closed the connection.
+    #[tokio::test]
+    async fn upgrade_after_close_fails() -> TestResult<()> {
+        let net = Incoming::new(short_idle_options()).await?;
+        let (_outgoing, conn_ref) = net.adopt().await?;
+        let weak = conn_ref.downgrade();
+        assert!(weak.upgrade().is_some());
+
+        net.pool.close(net.client.id()).await?;
+        tokio::time::timeout(SHORT_IDLE * 5, conn_ref.closed()).await?;
+        assert!(weak.upgrade().is_none(), "upgraded a closed connection");
+        net.server.close().await;
+        Ok(())
+    }
+
+    /// Upgrading fails once the pool has seen the remote close the connection.
+    #[tokio::test]
+    async fn upgrade_after_a_remote_close_fails() -> TestResult<()> {
+        let net = Incoming::new(short_idle_options()).await?;
+        let (outgoing, conn_ref) = net.adopt().await?;
+        let weak = conn_ref.downgrade();
+        drop(conn_ref);
+        outgoing.close(0u32.into(), b"gone");
+        until_retired(&weak).await?;
+        net.server.close().await;
+        Ok(())
+    }
+
+    /// Dropping the last pool handle closes its connections, in use ones as `drop`.
+    #[tokio::test]
+    async fn dropping_the_pool_closes_its_connections() -> TestResult<()> {
+        let net = Incoming::new(short_idle_options()).await?;
+        let (outgoing, conn_ref) = net.adopt().await?;
+        let weak = conn_ref.downgrade();
+
+        drop(net.pool);
+        let err = tokio::time::timeout(SHORT_IDLE * 5, outgoing.closed()).await?;
+        assert_closed_as(&err, CloseReason::Dropped);
+        assert!(weak.upgrade().is_none(), "upgraded after shutdown");
+        net.server.close().await;
         Ok(())
     }
 }
