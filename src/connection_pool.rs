@@ -34,14 +34,30 @@ use n0_future::{
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace};
 
-pub type OnConnected =
+/// A callback that runs for each new connection, see [`Options::with_on_connected`].
+pub(crate) type OnConnected =
     Arc<dyn Fn(&Endpoint, &Connection) -> n0_future::future::Boxed<io::Result<()>> + Send + Sync>;
 
 /// The pool is a single actor, so we can afford a larger inbox.
 const INBOX_CAPACITY: usize = 1024;
 
-/// Configuration options for the connection pool
+/// Configuration options for the connection pool.
+///
+/// Start from [`Options::default`] and set the fields you need. The struct is
+/// `#[non_exhaustive]`, so new options can be added without breaking callers.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use iroh_util::connection_pool::Options;
+///
+/// let mut options = Options::default();
+/// options.idle_timeout = Duration::from_secs(30);
+/// ```
 #[derive(derive_more::Debug, Clone)]
+#[non_exhaustive]
 pub struct Options {
     /// How long to keep unused connections around.
     ///
@@ -55,11 +71,9 @@ pub struct Options {
     /// Attempts to connect that are still running do not count, so attempts to
     /// peers that do not answer cannot take the place of connections.
     pub max_connections: usize,
-    /// An optional callback that can be used to wait for the connection to enter some state.
-    /// An example usage could be to wait for the connection to become direct before handing
-    /// it out to the user.
+    /// Set with [`Options::with_on_connected`].
     #[debug(skip)]
-    pub on_connected: Option<OnConnected>,
+    pub(crate) on_connected: Option<OnConnected>,
 }
 
 impl Default for Options {
@@ -74,7 +88,11 @@ impl Default for Options {
 }
 
 impl Options {
-    /// Set the on_connected callback
+    /// Sets a callback that runs for each new connection before the pool hands it out.
+    ///
+    /// Use it to wait for the connection to enter some state, for example to
+    /// become direct. [`Options::connect_timeout`] includes the time it takes.
+    #[must_use]
     pub fn with_on_connected<F, Fut>(mut self, f: F) -> Self
     where
         F: Fn(Endpoint, Connection) -> Fut + Send + Sync + 'static,
@@ -119,10 +137,12 @@ impl ConnectionRef {
 /// errors such as timeouts and connection limits.
 #[stack_error(derive, add_meta)]
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum PoolConnectError {
     /// Connection pool is shut down
     #[error("Connection pool is shut down")]
     Shutdown {},
+    /// [`ConnectionPool::close`] was called while connecting
     #[error("Connection was closed")]
     Closed {},
     /// Timeout during connect
@@ -133,10 +153,14 @@ pub enum PoolConnectError {
     TooManyConnections {},
     /// Error during connect
     #[error(transparent)]
-    ConnectError { source: Arc<ConnectError> },
+    ConnectError {
+        /// The error from [`Endpoint::connect`].
+        source: Arc<ConnectError>,
+    },
     /// Error during on_connect callback
     #[error(transparent)]
     OnConnectError {
+        /// The error the callback returned.
         #[error(std_err)]
         source: Arc<io::Error>,
     },
@@ -148,16 +172,11 @@ impl From<ConnectError> for PoolConnectError {
     }
 }
 
-impl From<io::Error> for PoolConnectError {
-    fn from(e: io::Error) -> Self {
-        e!(PoolConnectError::OnConnectError, Arc::new(e))
-    }
-}
-
 /// Error when calling a fn on the [`ConnectionPool`].
 ///
 /// The only thing that can go wrong is that the connection pool is shut down.
 #[stack_error(derive, add_meta)]
+#[non_exhaustive]
 pub enum ConnectionPoolError {
     /// The connection pool has been shut down
     #[error("The connection pool has been shut down")]
@@ -491,7 +510,9 @@ impl Actor {
                     .map_err(PoolConnectError::from)?;
                 connected = Some(conn.clone());
                 if let Some(f) = &on_connected {
-                    f(&endpoint, &conn).await.map_err(PoolConnectError::from)?;
+                    f(&endpoint, &conn)
+                        .await
+                        .map_err(|err| e!(PoolConnectError::OnConnectError, Arc::new(err)))?;
                 }
                 Result::<Connection, PoolConnectError>::Ok(conn)
             };
@@ -675,6 +696,11 @@ pub struct ConnectionPool {
 }
 
 impl ConnectionPool {
+    /// Creates a pool that connects with `endpoint`, for `alpn`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a Tokio runtime, since the pool spawns a task.
     pub fn new(endpoint: Endpoint, alpn: &[u8], options: Options) -> Self {
         let (actor, tx) = Actor::new(endpoint, alpn, options);
         n0_future::task::spawn(actor.run());

@@ -100,3 +100,50 @@ jobs:
           command: check
           arguments: --workspace --all-features
           command-arguments: "-Dwarnings"
+
+  check-external-types:
+    name: Check external types in public API
+    runs-on: ubuntu-latest
+    env:
+      # Pin to the nightly that the pinned `cargo-check-external-types`
+      # release was last tested against. Update both together.
+      CARGO_CHECK_EXTERNAL_TYPES_VERSION: "0.5.0"
+      TOOLCHAIN: "nightly-2026-03-20"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+      - uses: taiki-e/install-action@decb84fb327e5b809630c914eb4d1ca67cf59966 # v2.85.14
+        with:
+          tool: cargo-make,cargo-check-external-types@${{ env.CARGO_CHECK_EXTERNAL_TYPES_VERSION }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Check external types
+        run: cargo make check-external-types
+      - name: Lockfile must not have moved
+        # cargo make takes no --locked; assert the lockfile instead.
+        run: git diff --exit-code Cargo.lock
+
+  semver-checks:
+    name: Check semver
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@decb84fb327e5b809630c914eb4d1ca67cf59966 # v2.85.14
+        with:
+          tool: cargo-semver-checks
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Check semver against the base branch
+        # Compares with the base of the PR, or with the previous commit on a
+        # push. A breaking change fails unless Cargo.toml bumps the version.
+        env:
+          BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'HEAD~1' }}
+        run: cargo semver-checks --baseline-rev "$(git rev-parse "$BASE_REF")"
