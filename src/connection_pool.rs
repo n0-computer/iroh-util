@@ -918,11 +918,12 @@ mod tests {
             &self,
             id: EndpointId,
             text: Vec<u8>,
-        ) -> Result<Result<(usize, Vec<u8>), AnyError>, PoolConnectError> {
+        ) -> Result<Result<(Connection, Vec<u8>), AnyError>, PoolConnectError> {
             let conn = self.pool.get_or_connect(id).await?;
-            let id = conn.stable_id();
+            // A plain handle, so the pool does not count it as a use.
+            let handle = conn.connection.clone();
             match echo_client(&conn, &text).await {
-                Ok(res) => Ok(Ok((id, res))),
+                Ok(res) => Ok(Ok((handle, res))),
                 Err(e) => Ok(Err(e)),
             }
         }
@@ -969,22 +970,25 @@ mod tests {
             .await?;
         let pool = ConnectionPool::new(endpoint.clone(), ECHO_ALPN, test_options());
         let client = EchoClient { pool };
-        let mut connection_ids = BTreeMap::new();
+        // Keep the first connections alive: `stable_id` is an address, which a
+        // new connection can reuse once the old one is freed.
+        let mut first_conns = BTreeMap::new();
         let msg = b"Hello, pool!".to_vec();
         for id in &ids {
-            let (cid1, res) = client.echo(*id, msg.clone()).await??;
+            let (conn1, res) = client.echo(*id, msg.clone()).await??;
             assert_eq!(res, msg);
-            let (cid2, res) = client.echo(*id, msg.clone()).await??;
+            let (conn2, res) = client.echo(*id, msg.clone()).await??;
             assert_eq!(res, msg);
-            assert_eq!(cid1, cid2);
-            connection_ids.insert(id, cid1);
+            assert_eq!(conn1.stable_id(), conn2.stable_id());
+            first_conns.insert(id, conn1);
         }
         n0_future::time::sleep(Duration::from_millis(1000)).await;
         for id in &ids {
-            let cid1 = *connection_ids.get(id).expect("Connection ID not found");
-            let (cid2, res) = client.echo(*id, msg.clone()).await??;
+            let conn1 = first_conns.get(id).expect("Connection not found");
+            assert!(conn1.close_reason().is_some(), "idle connection not closed");
+            let (conn2, res) = client.echo(*id, msg.clone()).await??;
             assert_eq!(res, msg);
-            assert_ne!(cid1, cid2);
+            assert_ne!(conn1.stable_id(), conn2.stable_id());
         }
         shutdown_routers(routers).await;
         endpoint.close().await;
