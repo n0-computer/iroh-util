@@ -14,6 +14,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     fmt, io,
+    num::NonZeroUsize,
     ops::Deref,
     sync::{
         Arc,
@@ -54,17 +55,18 @@ pub struct Options {
     ///
     /// An attempt takes its slot when it starts, so a connection that the pool
     /// made always has room.
-    pub max_connections: usize,
+    pub max_connections: NonZeroUsize,
     /// Maximum number of attempts to connect that are running at the same time.
     ///
-    /// Keep this below [`Self::max_connections`], so that attempts to peers that
-    /// do not answer leave room for connections.
+    /// This and [`Self::max_connections`] are independent limits, and the pool
+    /// enforces both. Keep this below [`Self::max_connections`], so that
+    /// attempts to peers that do not answer leave room for connections.
     ///
     /// An attempt for a peer that was [closed] while it was running is no longer
     /// counted.
     ///
     /// [closed]: ConnectionPool::close
-    pub max_pending_connections: usize,
+    pub max_pending_connections: NonZeroUsize,
     /// An optional callback that can be used to wait for the connection to enter some state.
     /// An example usage could be to wait for the connection to become direct before handing
     /// it out to the user.
@@ -77,8 +79,8 @@ impl Default for Options {
         Self {
             idle_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(1),
-            max_connections: 1024,
-            max_pending_connections: 64,
+            max_connections: NonZeroUsize::new(1024).expect("not zero"),
+            max_pending_connections: NonZeroUsize::new(64).expect("not zero"),
             on_connected: None,
         }
     }
@@ -448,7 +450,7 @@ impl Actor {
             .values()
             .filter(|state| matches!(state, PeerState::Connecting { .. }))
             .count();
-        if pending >= self.options.max_pending_connections {
+        if pending >= self.options.max_pending_connections.get() {
             let _ = req
                 .tx
                 .send(Err(e!(PoolConnectError::TooManyPendingConnections)));
@@ -479,7 +481,7 @@ impl Actor {
     /// Evicts the connection that has been unused the longest, and returns
     /// `false` if there is none.
     fn make_room(&mut self) -> bool {
-        if self.peers.len() < self.options.max_connections {
+        if self.peers.len() < self.options.max_connections.get() {
             return true;
         }
         let Some(conn_id) = self.unused.pop_oldest() else {
@@ -783,6 +785,7 @@ impl Drop for OneConnection {
 mod tests {
     use std::{
         collections::BTreeMap,
+        num::NonZeroUsize,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -914,12 +917,16 @@ mod tests {
             .await;
     }
 
+    fn nz(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("not zero")
+    }
+
     fn test_options() -> Options {
         Options {
             idle_timeout: Duration::from_millis(100),
             connect_timeout: Duration::from_secs(5),
-            max_connections: 32,
-            max_pending_connections: 16,
+            max_connections: nz(32),
+            max_pending_connections: nz(16),
             on_connected: None,
         }
     }
@@ -1026,7 +1033,7 @@ mod tests {
             ECHO_ALPN,
             Options {
                 idle_timeout: Duration::from_secs(100),
-                max_connections: 8,
+                max_connections: nz(8),
                 ..test_options()
             },
         );
@@ -1441,8 +1448,8 @@ mod tests {
             ECHO_ALPN,
             Options {
                 connect_timeout,
-                max_connections: 4,
-                max_pending_connections,
+                max_connections: nz(4),
+                max_pending_connections: nz(max_pending_connections),
                 ..test_options()
             },
         );
@@ -1496,7 +1503,7 @@ mod tests {
             endpoint.clone(),
             ECHO_ALPN,
             Options {
-                max_connections: 1,
+                max_connections: nz(1),
                 ..test_options()
             },
         );
