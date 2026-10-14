@@ -845,6 +845,83 @@ mod tests {
 
     const ECHO_ALPN: &[u8] = b"echo";
 
+    /// Admission checks reject new attempts immediately, while requests for
+    /// the same peer share an attempt. Closing the peer releases its slot.
+    #[tokio::test]
+    async fn admission_limits_are_enforced_before_connecting() -> TestResult<()> {
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await?;
+        let first = SecretKey::from_bytes(&[71; 32]).public();
+        let second = SecretKey::from_bytes(&[72; 32]).public();
+        for (max_connections, max_pending_connections, pending_error) in
+            [(0, 1, false), (1, 0, true), (1, 2, false), (2, 1, true)]
+        {
+            let (mut actor, _inbox) = Actor::new(
+                endpoint.clone(),
+                ECHO_ALPN,
+                Options {
+                    max_connections,
+                    max_pending_connections,
+                    ..test_options()
+                },
+            );
+            let (tx, mut rx) = oneshot::channel();
+            actor.handle_request(RequestRef { id: first, tx });
+            if max_connections > 0 && max_pending_connections > 0 {
+                assert!(rx.try_recv().is_err());
+                assert_eq!(actor.peers.len(), 1);
+                let (tx, mut joined) = oneshot::channel();
+                actor.handle_request(RequestRef { id: first, tx });
+                assert!(joined.try_recv().is_err());
+                assert_eq!(actor.connecting.len(), 1);
+                let (tx, mut next) = oneshot::channel();
+                actor.handle_request(RequestRef { id: second, tx });
+                let error = next
+                    .try_recv()
+                    .expect("a new attempt should be rejected immediately")
+                    .unwrap_err();
+                assert!(
+                    if pending_error {
+                        matches!(error, PoolConnectError::TooManyPendingConnections { .. })
+                    } else {
+                        matches!(error, PoolConnectError::TooManyConnections { .. })
+                    },
+                    "unexpected error: {error:?}",
+                );
+                assert_eq!(actor.connecting.len(), 1);
+                actor.remove_peer(first);
+                assert!(matches!(rx.await?, Err(PoolConnectError::Closed { .. })));
+                assert!(matches!(
+                    joined.await?,
+                    Err(PoolConnectError::Closed { .. })
+                ));
+                let (tx, mut next) = oneshot::channel();
+                actor.handle_request(RequestRef { id: second, tx });
+                assert!(next.try_recv().is_err());
+                assert_eq!(actor.peers.len(), 1);
+            } else {
+                let error = rx
+                    .try_recv()
+                    .expect("a zero limit should reject attempts immediately")
+                    .unwrap_err();
+                assert!(
+                    if pending_error {
+                        matches!(error, PoolConnectError::TooManyPendingConnections { .. })
+                    } else {
+                        matches!(error, PoolConnectError::TooManyConnections { .. })
+                    },
+                    "unexpected error: {error:?}",
+                );
+                assert!(actor.peers.is_empty());
+                assert!(actor.connecting.is_empty());
+            }
+        }
+        endpoint.close().await;
+        Ok(())
+    }
+
     #[derive(Debug, Clone)]
     struct Echo;
 
