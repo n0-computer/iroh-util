@@ -40,3 +40,6 @@ allowed_external_types = [
     "iroh_base::*",
     "n0_error::*",
 ]
+
+[package.metadata.release]
+pre-release-hook = ["git", "cliff", "--unreleased", "--tag", "v{{version}}", "--prepend", "CHANGELOG.md"]
