@@ -66,11 +66,24 @@ pub struct Options {
     pub idle_timeout: Duration,
     /// Timeout for connect. This includes the time spent in on_connect, if set.
     pub connect_timeout: Duration,
-    /// Maximum number of connections to hand out.
+    /// Maximum number of connections, including attempts to connect that are still running.
     ///
-    /// Attempts to connect that are still running do not count, so attempts to
-    /// peers that do not answer cannot take the place of connections.
+    /// An attempt takes its slot when it starts, so a connection that the pool
+    /// made always has room. With 0, every new attempt fails with
+    /// [`PoolConnectError::TooManyConnections`].
     pub max_connections: usize,
+    /// Maximum number of attempts to connect that are running at the same time.
+    ///
+    /// This and [`Self::max_connections`] are independent limits, and the pool
+    /// enforces both. Keep this below [`Self::max_connections`], so that
+    /// attempts to peers that do not answer leave room for connections. With 0,
+    /// every new attempt fails with [`PoolConnectError::TooManyPendingConnections`].
+    ///
+    /// An attempt for a peer that was [closed] while it was running is no longer
+    /// counted.
+    ///
+    /// [closed]: ConnectionPool::close
+    pub max_pending_connections: usize,
     /// Set with [`Options::with_on_connected`].
     #[debug(skip)]
     pub(crate) on_connected: Option<OnConnected>,
@@ -82,6 +95,7 @@ impl Default for Options {
             idle_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(1),
             max_connections: 1024,
+            max_pending_connections: 64,
             on_connected: None,
         }
     }
@@ -151,6 +165,9 @@ pub enum PoolConnectError {
     /// Too many connections
     #[error("Too many connections")]
     TooManyConnections {},
+    /// Too many attempts to connect are running, see [`Options::max_pending_connections`]
+    #[error("Too many pending connections")]
+    TooManyPendingConnections {},
     /// Error during connect
     #[error(transparent)]
     ConnectError {
@@ -448,6 +465,17 @@ impl Actor {
             }
         }
 
+        let pending = self
+            .peers
+            .values()
+            .filter(|state| matches!(state, PeerState::Connecting { .. }))
+            .count();
+        if pending >= self.options.max_pending_connections {
+            let _ = req
+                .tx
+                .send(Err(e!(PoolConnectError::TooManyPendingConnections)));
+            return;
+        }
         if !self.make_room() {
             let _ = req.tx.send(Err(e!(PoolConnectError::TooManyConnections)));
             return;
@@ -469,15 +497,11 @@ impl Actor {
 
     /// Makes room for one more connection if the pool holds `max_connections`.
     ///
+    /// Attempts to connect count, so that each one has room when it succeeds.
     /// Evicts the connection that has been unused the longest, and returns
     /// `false` if there is none.
     fn make_room(&mut self) -> bool {
-        let connections = self
-            .peers
-            .values()
-            .filter(|state| matches!(state, PeerState::Ready { .. }))
-            .count();
-        if connections < self.options.max_connections {
+        if self.peers.len() < self.options.max_connections {
             return true;
         }
         let Some(conn_id) = self.unused.pop_oldest() else {
@@ -555,15 +579,8 @@ impl Actor {
         let Some(PeerState::Connecting { waiters, .. }) = self.peers.remove(&id) else {
             return;
         };
+        // The attempt took its slot when it started, so the connection has room.
         match result {
-            // Connections made since this attempt started may have filled the pool.
-            Ok(conn) if !self.make_room() => {
-                debug!(%id, "connected, but the pool is full");
-                conn.close(0u32.into(), b"too many connections");
-                for tx in waiters {
-                    let _ = tx.send(Err(e!(PoolConnectError::TooManyConnections)));
-                }
-            }
             Ok(conn) => {
                 let counter = ConnectionCounter::new(conn_id, self.unused_tx.clone());
                 for tx in waiters {
@@ -854,6 +871,83 @@ mod tests {
 
     const ECHO_ALPN: &[u8] = b"echo";
 
+    /// Admission checks reject new attempts immediately, while requests for
+    /// the same peer share an attempt. Closing the peer releases its slot.
+    #[tokio::test]
+    async fn admission_limits_are_enforced_before_connecting() -> TestResult<()> {
+        let endpoint = iroh::Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await?;
+        let first = SecretKey::from_bytes(&[71; 32]).public();
+        let second = SecretKey::from_bytes(&[72; 32]).public();
+        for (max_connections, max_pending_connections, pending_error) in
+            [(0, 1, false), (1, 0, true), (1, 2, false), (2, 1, true)]
+        {
+            let (mut actor, _inbox) = Actor::new(
+                endpoint.clone(),
+                ECHO_ALPN,
+                Options {
+                    max_connections,
+                    max_pending_connections,
+                    ..test_options()
+                },
+            );
+            let (tx, mut rx) = oneshot::channel();
+            actor.handle_request(RequestRef { id: first, tx });
+            if max_connections > 0 && max_pending_connections > 0 {
+                assert!(rx.try_recv().is_err());
+                assert_eq!(actor.peers.len(), 1);
+                let (tx, mut joined) = oneshot::channel();
+                actor.handle_request(RequestRef { id: first, tx });
+                assert!(joined.try_recv().is_err());
+                assert_eq!(actor.connecting.len(), 1);
+                let (tx, mut next) = oneshot::channel();
+                actor.handle_request(RequestRef { id: second, tx });
+                let error = next
+                    .try_recv()
+                    .expect("a new attempt should be rejected immediately")
+                    .unwrap_err();
+                assert!(
+                    if pending_error {
+                        matches!(error, PoolConnectError::TooManyPendingConnections { .. })
+                    } else {
+                        matches!(error, PoolConnectError::TooManyConnections { .. })
+                    },
+                    "unexpected error: {error:?}",
+                );
+                assert_eq!(actor.connecting.len(), 1);
+                actor.remove_peer(first);
+                assert!(matches!(rx.await?, Err(PoolConnectError::Closed { .. })));
+                assert!(matches!(
+                    joined.await?,
+                    Err(PoolConnectError::Closed { .. })
+                ));
+                let (tx, mut next) = oneshot::channel();
+                actor.handle_request(RequestRef { id: second, tx });
+                assert!(next.try_recv().is_err());
+                assert_eq!(actor.peers.len(), 1);
+            } else {
+                let error = rx
+                    .try_recv()
+                    .expect("a zero limit should reject attempts immediately")
+                    .unwrap_err();
+                assert!(
+                    if pending_error {
+                        matches!(error, PoolConnectError::TooManyPendingConnections { .. })
+                    } else {
+                        matches!(error, PoolConnectError::TooManyConnections { .. })
+                    },
+                    "unexpected error: {error:?}",
+                );
+                assert!(actor.peers.is_empty());
+                assert!(actor.connecting.is_empty());
+            }
+        }
+        endpoint.close().await;
+        Ok(())
+    }
+
     #[derive(Debug, Clone)]
     struct Echo;
 
@@ -931,6 +1025,7 @@ mod tests {
             idle_timeout: Duration::from_millis(100),
             connect_timeout: Duration::from_secs(5),
             max_connections: 32,
+            max_pending_connections: 16,
             on_connected: None,
         }
     }
@@ -944,11 +1039,12 @@ mod tests {
             &self,
             id: EndpointId,
             text: Vec<u8>,
-        ) -> Result<Result<(usize, Vec<u8>), AnyError>, PoolConnectError> {
+        ) -> Result<Result<(Connection, Vec<u8>), AnyError>, PoolConnectError> {
             let conn = self.pool.get_or_connect(id).await?;
-            let id = conn.stable_id();
+            // A plain handle, so the pool does not count it as a use.
+            let handle = conn.connection.clone();
             match echo_client(&conn, &text).await {
-                Ok(res) => Ok(Ok((id, res))),
+                Ok(res) => Ok(Ok((handle, res))),
                 Err(e) => Ok(Err(e)),
             }
         }
@@ -995,22 +1091,25 @@ mod tests {
             .await?;
         let pool = ConnectionPool::new(endpoint.clone(), ECHO_ALPN, test_options());
         let client = EchoClient { pool };
-        let mut connection_ids = BTreeMap::new();
+        // Keep the first connections alive: `stable_id` is an address, which a
+        // new connection can reuse once the old one is freed.
+        let mut first_conns = BTreeMap::new();
         let msg = b"Hello, pool!".to_vec();
         for id in &ids {
-            let (cid1, res) = client.echo(*id, msg.clone()).await??;
+            let (conn1, res) = client.echo(*id, msg.clone()).await??;
             assert_eq!(res, msg);
-            let (cid2, res) = client.echo(*id, msg.clone()).await??;
+            let (conn2, res) = client.echo(*id, msg.clone()).await??;
             assert_eq!(res, msg);
-            assert_eq!(cid1, cid2);
-            connection_ids.insert(id, cid1);
+            assert_eq!(conn1.stable_id(), conn2.stable_id());
+            first_conns.insert(id, conn1);
         }
         n0_future::time::sleep(Duration::from_millis(1000)).await;
         for id in &ids {
-            let cid1 = *connection_ids.get(id).expect("Connection ID not found");
-            let (cid2, res) = client.echo(*id, msg.clone()).await??;
+            let conn1 = first_conns.get(id).expect("Connection not found");
+            assert!(conn1.close_reason().is_some(), "idle connection not closed");
+            let (conn2, res) = client.echo(*id, msg.clone()).await??;
             assert_eq!(res, msg);
-            assert_ne!(cid1, cid2);
+            assert_ne!(conn1.stable_id(), conn2.stable_id());
         }
         shutdown_routers(routers).await;
         endpoint.close().await;
@@ -1414,20 +1513,19 @@ mod tests {
         Ok(())
     }
 
-    /// In-flight attempts do not count towards [`Options::max_connections`].
+    /// Attempts to dead peers are capped by [`Options::max_pending_connections`].
     ///
-    /// Otherwise peers we are still trying to reach take every slot, and
-    /// unrelated peers fail with `TooManyConnections` until `connect_timeout`
-    /// expires.
+    /// At the cap, a new attempt fails at once, while connections the pool
+    /// already holds are still handed out. Once the attempts time out, new
+    /// attempts can run again.
     #[tokio::test]
-    async fn inflight_connects_do_not_exhaust_slots() -> TestResult<()> {
-        let (live_ids, routers, address_lookup) = echo_servers(1).await?;
-        let live_peer = live_ids[0];
+    async fn pending_connects_are_capped() -> TestResult<()> {
+        let (live_ids, routers, address_lookup) = echo_servers(2).await?;
 
-        let max_connections = 2;
+        let max_pending_connections = 2;
         let mut dead = Vec::new();
         let mut _socks = Vec::new();
-        for i in 0..max_connections {
+        for i in 0..max_pending_connections {
             let (sock, addr) = dead_addr()?;
             _socks.push(sock);
             let id = SecretKey::from_bytes(&[20 + i as u8; 32]).public();
@@ -1443,18 +1541,21 @@ mod tests {
             .address_lookup(address_lookup)
             .bind()
             .await?;
+        let connect_timeout = Duration::from_secs(1);
         let pool = ConnectionPool::new(
             endpoint.clone(),
             ECHO_ALPN,
             Options {
-                connect_timeout: Duration::from_secs(5),
-                max_connections,
+                connect_timeout,
+                max_connections: 4,
+                max_pending_connections,
                 ..test_options()
             },
         );
+        let conn = pool.get_or_connect(live_ids[0]).await?;
 
-        // Park the pool at its connection limit with attempts that neither
-        // succeed nor fail until connect_timeout expires.
+        // Fill the pending slots with attempts that neither succeed nor fail
+        // until connect_timeout expires.
         let mut parked = Vec::new();
         for id in dead {
             let pool = pool.clone();
@@ -1464,26 +1565,31 @@ mod tests {
         }
         n0_future::time::sleep(Duration::from_millis(100)).await;
 
-        let res = pool.get_or_connect(live_peer).await;
+        let start = Instant::now();
+        let res = pool.get_or_connect(live_ids[1]).await;
         assert!(
-            res.is_ok(),
-            "unrelated peer rejected while pool holds no connections: {res:?}"
+            matches!(res, Err(PoolConnectError::TooManyPendingConnections { .. })),
+            "{res:?}"
         );
-        drop(res);
+        assert!(start.elapsed() < connect_timeout, "rejection must not wait");
+        let again = pool.get_or_connect(live_ids[0]).await?;
+        assert_eq!(again.stable_id(), conn.stable_id());
 
-        // Let the parked attempts finish before tearing the endpoint down.
         for p in parked {
-            let _ = p.await;
+            let res = p.await?;
+            assert!(
+                matches!(res, Err(PoolConnectError::Timeout { .. })),
+                "{res:?}"
+            );
         }
+        pool.get_or_connect(live_ids[1]).await?;
+
+        drop((conn, again));
         shutdown_routers(routers).await;
         endpoint.close().await;
         Ok(())
     }
 
-    /// A connection made after the pool filled up fails with `TooManyConnections`.
-    ///
-    /// Attempts no longer reserve a slot, so without a second check the pool
-    /// would go over `max_connections`.
     #[tokio::test]
     async fn connect_into_a_full_pool_fails() -> TestResult<()> {
         let (ids, routers, address_lookup) = echo_servers(2).await?;
